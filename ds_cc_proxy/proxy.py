@@ -424,6 +424,7 @@ async def proxy(request):
 
     modified_body = body
     strip_thinking = True
+    is_subagent = False  # set to True below for disabled→enabled conversions
 
     if is_messages:
         try:
@@ -549,6 +550,7 @@ async def proxy(request):
         all_filtered = []
         buffer = ""
         max_buffer_bytes = 1024 * 1024  # 1MB
+        response_usage = {}
 
         try:
             async for chunk in upstream_resp.aiter_bytes():
@@ -556,21 +558,24 @@ async def proxy(request):
                 buffer += text
                 if len(buffer) > max_buffer_bytes:
                     logger.warning("[FILTER] SSE buffer overflow, truncating")
-                    # Flush buffer as-is and reset
                     yield buffer.encode("utf-8")
                     buffer = ""
                     continue
 
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
-                    # C1: handle SSE \r\n line separators per spec
-                    line = line.rstrip("\r")
+                    line = line.rstrip("\r")  # C1: handle SSE \r\n per spec
 
                     if line.startswith("data: ") and len(event_types) < MAX_EVENT_TYPES:
                         try:
                             d = json.loads(line[6:])
                             if isinstance(d, dict):
-                                event_types.append(d.get("type", "?"))
+                                t = d.get("type", "?")
+                                event_types.append(t)
+                                if t in ("message_stop", "message_delta"):
+                                    u = d.get("usage")
+                                    if isinstance(u, dict):
+                                        response_usage.update(u)
                         except json.JSONDecodeError:
                             pass
 
@@ -599,12 +604,23 @@ async def proxy(request):
         finally:
             logger.info("[RESP-EVENTS] raw=%s", event_types[:LOG_EVENT_PREVIEW])
             logger.info("[RESP-FILTERED] lines=%d", len(all_filtered))
+            if response_usage:
+                role = "subagent" if is_subagent else "primary"
+                logger.info(
+                    "[COST] role=%s model=%s input=%s output=%s cache_read=%s",
+                    role,
+                    data.get("model", "?"),
+                    response_usage.get("input_tokens", 0),
+                    response_usage.get("output_tokens", 0),
+                    response_usage.get("cache_read_input_tokens", 0),
+                )
             _dump_json(
                 "last_response_events.json",
                 {
                     "raw_events": event_types,
                     "filtered_count": len(all_filtered),
                     "first_filtered": all_filtered[:DUMP_PREVIEW_LINES],
+                    "usage": response_usage,
                 },
             )
             try:
