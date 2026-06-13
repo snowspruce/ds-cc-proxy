@@ -331,51 +331,6 @@ def _thinking_requested(data: dict) -> bool:
     return isinstance(thinking_cfg, dict) and thinking_cfg.get("type") in ("enabled", "adaptive")
 
 
-# ---- Fix 4: prompt cache hints ----
-
-
-def _inject_cache_control(data: dict) -> bool:
-    """Mark cacheable content with ``cache_control`` breakpoints for DeepSeek prompt caching.
-
-    Inserts ``{"type": "ephemeral"}`` markers on:
-    - System prompt (string or content-block form)
-    - Last message in the conversation
-
-    Returns True if any marker was injected.
-    """
-    modified = False
-
-    # Mark system prompt
-    system = data.get("system")
-    if isinstance(system, str) and system:
-        data["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
-        modified = True
-    elif isinstance(system, list) and system:
-        last = system[-1]
-        if isinstance(last, dict) and "cache_control" not in last:
-            last["cache_control"] = {"type": "ephemeral"}
-            modified = True
-
-    # Mark last message in the conversation
-    messages = data.get("messages")
-    if isinstance(messages, list) and messages:
-        last_msg = messages[-1]
-        if isinstance(last_msg, dict):
-            content = last_msg.get("content")
-            if isinstance(content, list) and content:
-                last_block = content[-1]
-                if isinstance(last_block, dict) and "cache_control" not in last_block:
-                    last_block["cache_control"] = {"type": "ephemeral"}
-                    modified = True
-            elif isinstance(content, str) and content:
-                last_msg["content"] = [
-                    {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
-                ]
-                modified = True
-
-    return modified
-
-
 def _process_sse_data_line(
     line: str, thinking_indices: set, event_types: list, response_usage: dict
 ) -> tuple:
@@ -582,10 +537,6 @@ async def proxy(request):
                     logger.info("[FLASH] routing to %s model=%s", DEEPSEEK_FLASH, FLASH_MODEL)
                 else:
                     logger.info("[FLASH] routing to %s (model unchanged)", DEEPSEEK_FLASH)
-                thinking_normalized = True
-
-            if _inject_cache_control(data):
-                logger.info("[CACHE] injected cache_control markers")
                 thinking_normalized = True
 
             if thinking_normalized:

@@ -94,12 +94,6 @@ curl http://localhost:16889/health
 
 Transient failures (network blips, 502/503) are retried automatically with exponential backoff. After `PROXY_CIRCUIT_BREAKER_THRESHOLD` consecutive failures, the circuit opens — all requests immediately return 503 until a half-open trial succeeds. No more cascading timeouts.
 
-### Caching · Prompt Cache Hints
-
-`cache_control: ephemeral` breakpoints are injected on system prompts and the last message of each request. DeepSeek caches the matching prefix — subsequent requests with the same prefix pay only 10% for cached input tokens. Transparent to Claude Code; check `[COST]` logs for `cache_hit%`.
-
----
-
 <a id="comparison"></a>
 ##  Comparison
 
