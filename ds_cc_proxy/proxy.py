@@ -301,6 +301,26 @@ def _filter_sse_line(line: str, thinking_indices: set) -> tuple:
     return line, thinking_indices
 
 
+def _track_event_type(line: str, event_types: list, response_usage: dict) -> None:
+    """Extract event type and usage from a ``data:`` SSE line."""
+    if not line.startswith("data: "):
+        return
+    if len(event_types) >= MAX_EVENT_TYPES:
+        return
+    try:
+        d = json.loads(line[6:])
+    except json.JSONDecodeError:
+        return
+    if not isinstance(d, dict):
+        return
+    t = d.get("type", "?")
+    event_types.append(t)
+    if t in ("message_stop", "message_delta"):
+        u = d.get("usage")
+        if isinstance(u, dict):
+            response_usage.update(u)
+
+
 # ---- Traffic capture ----
 
 
@@ -424,11 +444,13 @@ async def proxy(request):
 
     modified_body = body
     strip_thinking = True
-    is_subagent = False  # set to True below for disabled→enabled conversions
 
     if is_messages:
+        is_subagent = False
+        model_name = "?"
         try:
             data = json.loads(body)
+            model_name = data.get("model", "?")
             logger.info("[REQ] %s", json.dumps(_summarize_request(data), ensure_ascii=False))
             _dump_json("last_request.json", data)
 
@@ -566,18 +588,8 @@ async def proxy(request):
                     line, buffer = buffer.split("\n", 1)
                     line = line.rstrip("\r")  # C1: handle SSE \r\n per spec
 
-                    if line.startswith("data: ") and len(event_types) < MAX_EVENT_TYPES:
-                        try:
-                            d = json.loads(line[6:])
-                            if isinstance(d, dict):
-                                t = d.get("type", "?")
-                                event_types.append(t)
-                                if t in ("message_stop", "message_delta"):
-                                    u = d.get("usage")
-                                    if isinstance(u, dict):
-                                        response_usage.update(u)
-                        except json.JSONDecodeError:
-                            pass
+                    if line.startswith("data: "):
+                        _track_event_type(line, event_types, response_usage)
 
                     filtered, thinking_indices = _filter_sse_line(line, thinking_indices)
                     if filtered is not None:
@@ -588,18 +600,8 @@ async def proxy(request):
             # C1: handle trailing buffer (rstrip \r as above)
             buffer = buffer.rstrip("\r")
             if buffer.strip():
-                if buffer.startswith("data: ") and len(event_types) < MAX_EVENT_TYPES:
-                    try:
-                        d = json.loads(buffer[6:])
-                        if isinstance(d, dict):
-                            t = d.get("type", "?")
-                            event_types.append(t)
-                            if t in ("message_stop", "message_delta"):
-                                u = d.get("usage")
-                                if isinstance(u, dict):
-                                    response_usage.update(u)
-                    except json.JSONDecodeError:
-                        pass
+                if buffer.startswith("data: "):
+                    _track_event_type(buffer, event_types, response_usage)
                 filtered, thinking_indices = _filter_sse_line(buffer, thinking_indices)
                 if filtered is not None:
                     yield (filtered + "\n").encode("utf-8")
@@ -614,7 +616,7 @@ async def proxy(request):
                 logger.info(
                     "[COST] role=%s model=%s input=%s output=%s cache_read=%s",
                     role,
-                    data.get("model", "?"),
+                    model_name,
                     response_usage.get("input_tokens", 0),
                     response_usage.get("output_tokens", 0),
                     response_usage.get("cache_read_input_tokens", 0),
