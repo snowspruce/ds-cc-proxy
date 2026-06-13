@@ -12,20 +12,42 @@ Claude Code ←→ localhost:16889 (dsv4-cc-proxy) ←→ api.deepseek.com/anthr
 
 ### 修复的问题
 
-| 类别 | 问题 | 原版行为 | 修复后 |
-|------|------|----------|--------|
-| **功能性** | adaptive thinking 被错误剥离 | Claude Code 2.1.167 默认 `adaptive` 模式触发 thinking 剥离，导致功能异常 | 识别 `adaptive` 类型，透传 thinking |
-| **稳定性** | 连接池耗尽 | 固定 20 连接，thinking mode 长连接占满后所有请求返回 502 | 50 连接 + 120s 排队超时 + 503 Retry-After |
-| **稳定性** | 上游错误透传 | 4xx/5xx 被当作 SSE 解析，客户端收到乱码 | 4xx/5xx 先于 SSE 解析检查，直接透传 |
-| **鲁棒性** | 配置解析崩溃 | `int(os.getenv(...))` 遇非法值直接进程崩溃 | try/except + 合法性校验 + 安全降级 |
-| **鲁棒性** | dump 目录缺失 | `_dump_json` 遇目录不存在/不可写时崩溃 | 启动时 `os.makedirs` + OSError 捕获 |
-| **鲁棒性** | SSE 解析崩溃 | `data["index"]` KeyError、`data: null` 致 `.get()` AttributeError | `.get()` + isinstance 守卫 |
-| **鲁棒性** | SSE buffer OOM | buffer 无上限 | 1MB 上限防溢出 |
-| **鲁棒性** | tools/messages 格式异常 | 非 list 类型的 tools/content 致 TypeError/KeyError | isinstance 类型守卫 |
-| **生命周期** | 优雅关闭 | 暴力 `aclose()` 切断活跃流 | 5s 排空期 + shutdown 标志 |
-| **生命周期** | 流异常覆盖 | `aclose()` 抛异常覆盖原始错误 | try/except 包装 |
-| **可运维** | 日志冲突 | 清除 root logger 与 uvicorn 冲突 | 专用 app logger 隔离 |
-| **可运维** | content-encoding 错误剥离 | 剥离后压缩字节当成未压缩数据返回 | 保留 content-encoding 头 |
+**功能性**
+
+| 问题 | 原版 | 修复后 |
+|------|------|--------|
+| adaptive thinking 被错误剥离 | Claude Code 2.1.167 `adaptive` 模式触发 thinking 剥离，功能异常 | 识别 `adaptive`，透传 thinking |
+
+**稳定性**
+
+| 问题 | 原版 | 修复后 |
+|------|------|--------|
+| 连接池耗尽 | 固定 20 连接，长连接占满后全部 502 | 50 连接 + 120s 排队 + 503 Retry-After |
+| 上游 4xx/5xx 被误解析 | 当作 SSE 流解析，客户端收到乱码 | 状态码 ≥400 直接透传 |
+
+**鲁棒性**
+
+| 问题 | 原版 | 修复后 |
+|------|------|--------|
+| 环境变量解析崩溃 | `int(os.getenv(...))` 遇非法值进程崩溃 | try/except + 范围校验 + 安全降级 |
+| dump 目录不存在崩溃 | `open()` 失败无处理 | `os.makedirs(exist_ok=True)` + OSError 捕获 |
+| `data: null` 致 SSE 解析崩溃 | `data["index"]` KeyError、`.get()` on None | `.get()` + `isinstance(dict)` 守卫 |
+| SSE buffer 无界增长 | 无上限，长连接可能 OOM | 1MB 上限 |
+| tools/content 非 list | 假设 list 致 TypeError/KeyError | isinstance 类型守卫 |
+
+**生命周期**
+
+| 问题 | 原版 | 修复后 |
+|------|------|--------|
+| 关闭时暴力切断活跃流 | `aclose()` 立即断开 | 5s 排空期 + shutdown 信号 |
+| aclose 异常掩盖原始错误 | 异常覆盖，丢失根因 | try/except 独立记录 |
+
+**可运维**
+
+| 问题 | 原版 | 修复后 |
+|------|------|--------|
+| root logger 污染 uvicorn 日志 | 清除全局 handler，日志混乱 | 专用 app logger 隔离 |
+| content-encoding 错误剥离 | 剥离压缩头，压缩数据当明文返回 | 保留 content-encoding |
 
 ## 快速开始
 
@@ -69,6 +91,15 @@ dsv4-cc-proxy --stop
 curl http://localhost:16889/health
 # {"status":"ok","version":"1.9.0","upstream":"https://api.deepseek.com/anthropic"}
 ```
+
+## 与本地代理的关系
+
+dsv4-cc-proxy 监听 `127.0.0.1:16889`，仅处理 Claude Code 通过 `ANTHROPIC_BASE_URL` 显式发来的请求，与 Clash Verge、V2Ray 等系统级代理互不冲突：
+
+- **Clash Verge / V2Ray**：作为系统 HTTP/SOCKS5 代理（通常 `127.0.0.1:7890`），接管浏览器和大部分应用的出站流量
+- **dsv4-cc-proxy**：应用层代理，Claude Code 直连 `localhost:16889`，不经过系统代理
+
+两者工作在不同网络层，可同时运行，无需任何特殊配置。
 
 ## 许可证
 
