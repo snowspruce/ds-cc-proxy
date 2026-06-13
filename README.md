@@ -17,7 +17,7 @@
 Claude Code ←→ localhost:16889 ←→ api.deepseek.com/anthropic
 ```
 
-[Quick Start](#-quick-start) · [Comparison](#-comparison) · [中文](./README_CN.md)
+[Quick Start](#quick-start) · [Comparison](#comparison) · [中文](./README_CN.md)
 
 </div>
 
@@ -42,6 +42,7 @@ Claude Code ←→ localhost:16889 ←→ api.deepseek.com/anthropic
 
 ## &nbsp;
 
+<a id="quick-start"></a>
 ##  Quick Start
 
 <div align="center">
@@ -86,6 +87,7 @@ curl http://localhost:16889/health
 
 ---
 
+<a id="comparison"></a>
 ##  Comparison
 
 | | **ds-cc-proxy** | LiteLLM | CCR | OpenRouter |

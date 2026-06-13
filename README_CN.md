@@ -17,7 +17,7 @@
 Claude Code ←→ localhost:16889 ←→ api.deepseek.com/anthropic
 ```
 
-[快速开始](#-快速开始) · [对比](#-同类工具对比) · [English](./README.md)
+[快速开始](#quick-start) · [对比](#comparison) · [English](./README.md)
 
 </div>
 
@@ -42,6 +42,7 @@ Claude Code ←→ localhost:16889 ←→ api.deepseek.com/anthropic
 
 ## &nbsp;
 
+<a id="quick-start"></a>
 ##  快速开始
 
 <div align="center">
@@ -86,6 +87,7 @@ curl http://localhost:16889/health
 
 ---
 
+<a id="comparison"></a>
 ##  同类工具对比
 
 | | **ds-cc-proxy** | LiteLLM | CCR | OpenRouter |
