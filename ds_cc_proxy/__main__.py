@@ -85,7 +85,10 @@ def main():
             print(f"Output:       {data['output_tokens']:,} tokens")
             print(f"Cache hit:    {data['cache_hit_pct']}%")
             print(f"Est. cost:    ${data['estimated_cost_usd']}")
-            print(f"Est. saved:   ${data['estimated_saved_usd']}")
+            saved = data["estimated_saved_usd"]
+            green = "\033[32m"
+            reset = "\033[0m"
+            print(f"Est. saved:   {green}${saved}{reset}")
             if data.get("primary"):
                 p = data["primary"]
                 pi, po = p["input_tokens"], p["output_tokens"]

@@ -169,17 +169,41 @@ async def usage_endpoint(request):
     cache = _usage["cache_read"]
     cacheable = inp + cache
     hit_pct = (cache * 100 // cacheable) if cacheable > 0 else 0
-    # Cost model: DeepSeek V4 Pro ~$0.50/MTok input, ~$2.00/MTok output
-    est_cost = round(inp / 1_000_000 * 0.50 + out / 1_000_000 * 2.00, 3)
 
-    # Savings estimate for sub-agents
-    sub = _usage_subagent
-    sub_reqs = sub["requests"]
-    sub_out = sub["output_tokens"]
-    # Without budget_tokens=2048, deepseek would use default ~4000 thinking tok/req
-    # Budget caps it at ~2000 — saving ~2000 output tok/req (≈50% of actual out)
-    saved_thinking_tokens = sub_out  # actual output ≈ 50% of what it would be
-    saved_thinking_cost = round(saved_thinking_tokens / 1_000_000 * 2.00, 3)
+    # DeepSeek V4 pricing (per MTok, cache miss):
+    #   V4-Pro:  input $1.74, output $3.48
+    #   V4-Flash: input $0.14, output $0.28
+    # Source: https://api-docs.deepseek.com/quick_start/pricing
+    price_pro_in = 1.74
+    price_pro_out = 3.48
+    price_flash_in = 0.14
+    price_flash_out = 0.28
+
+    p = _usage_primary
+    s = _usage_subagent
+    p_cost = round(
+        p["input_tokens"] / 1_000_000 * price_pro_in
+        + p["output_tokens"] / 1_000_000 * price_pro_out,
+        3,
+    )
+    s_cost = round(
+        s["input_tokens"] / 1_000_000 * price_flash_in
+        + s["output_tokens"] / 1_000_000 * price_flash_out,
+        3,
+    )
+    est_cost = round(p_cost + s_cost, 3)
+
+    # Savings: sub-agents without optimization
+    #   - Would be on Pro (not Flash) → save (price_pro - price_flash) per token
+    #   - budget_tokens=2048 caps thinking at ~2000 tok/req vs default ~4000
+    #     Actual sub-agent output ≈ 50% of unconstrained. Saving ≈ sub_out
+    s_input_saved = round(
+        s["input_tokens"] / 1_000_000 * (price_pro_in - price_flash_in), 3
+    )
+    s_output_saved = round(
+        s["output_tokens"] / 1_000_000 * price_pro_out, 3
+    )
+    s_saved = round(s_input_saved + s_output_saved, 3)
 
     return JSONResponse(
         {
@@ -188,11 +212,10 @@ async def usage_endpoint(request):
             "output_tokens": out,
             "cache_hit_pct": hit_pct,
             "estimated_cost_usd": est_cost,
-            "subagent_requests": sub_reqs,
-            "subagent_saved_thinking_tokens": saved_thinking_tokens,
-            "estimated_saved_usd": saved_thinking_cost,
-            "primary": None if not _usage_primary["requests"] else dict(_usage_primary),
-            "subagent": dict(sub),
+            "primary": None if not p["requests"] else dict(p),
+            "subagent": dict(s),
+            "subagent_saved_thinking_tokens": s["output_tokens"],
+            "estimated_saved_usd": s_saved,
         }
     )
 
@@ -203,7 +226,6 @@ _circuit_state = "closed"  # closed | open | half_open
 _circuit_failures = 0
 _circuit_opened_at = 0.0
 
-_RETRYABLE_STATUS = {429, 502, 503}
 _RETRYABLE_EXCEPTIONS = (
     httpx.TimeoutException,
     httpx.ConnectError,
