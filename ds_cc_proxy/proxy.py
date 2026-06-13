@@ -665,7 +665,7 @@ def create_app() -> Starlette:
             Route(
                 "/{path:path}",
                 proxy,
-                methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+                methods=["POST"],
             ),
         ],
     )
