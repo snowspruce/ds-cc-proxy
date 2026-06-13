@@ -592,7 +592,12 @@ async def proxy(request):
                     try:
                         d = json.loads(buffer[6:])
                         if isinstance(d, dict):
-                            event_types.append(d.get("type", "?"))
+                            t = d.get("type", "?")
+                            event_types.append(t)
+                            if t in ("message_stop", "message_delta"):
+                                u = d.get("usage")
+                                if isinstance(u, dict):
+                                    response_usage.update(u)
                     except json.JSONDecodeError:
                         pass
                 filtered, thinking_indices = _filter_sse_line(buffer, thinking_indices)
