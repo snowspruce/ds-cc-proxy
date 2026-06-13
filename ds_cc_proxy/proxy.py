@@ -170,14 +170,14 @@ async def usage_endpoint(request):
     cacheable = inp + cache
     hit_pct = (cache * 100 // cacheable) if cacheable > 0 else 0
 
-    # DeepSeek V4 pricing (per MTok, cache miss):
-    #   V4-Pro:  input $1.74, output $3.48
-    #   V4-Flash: input $0.14, output $0.28
-    # Source: https://api-docs.deepseek.com/quick_start/pricing
-    price_pro_in = 1.74
-    price_pro_out = 3.48
-    price_flash_in = 0.14
-    price_flash_out = 0.28
+    # DeepSeek V4 official pricing (per MTok, RMB):
+    #   V4-Pro:  input ¥3, output ¥6  (cache miss)
+    #   V4-Flash: input ¥1, output ¥2  (cache miss)
+    # Source: https://platform.deepseek.com/api-docs/pricing
+    price_pro_in = 3.0
+    price_pro_out = 6.0
+    price_flash_in = 1.0
+    price_flash_out = 2.0
 
     p = _usage_primary
     s = _usage_subagent
