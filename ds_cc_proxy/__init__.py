@@ -1,9 +1,9 @@
-# ds-cc-proxy — DeepSeek Anthropic API 兼容性代理
+# ds-cc-proxy — DeepSeek Anthropic API compatibility proxy
 #
-# 双向代理修复 DeepSeek V4 Anthropic API 兼容性问题:
-#   1. 请求端: 为缺 thinking 块的 tool_use assistant 消息注入空 thinking 块
-#   2. 请求端: adaptive 等不支持的 thinking 模式 → disabled + 移除 effort
-#   3. 响应端: 剥离意外 thinking/thinking_delta/signature_delta SSE 事件
+# Bidirectional proxy fixes for DeepSeek V4 Anthropic API compatibility:
+#   1. Request-side: inject empty thinking blocks for tool_use assistant messages missing them
+#   2. Request-side: convert unsupported thinking modes (disabled → enabled)
+#   3. Response-side: strip unexpected thinking/thinking_delta/signature_delta SSE events
 
 from ds_cc_proxy._version import VERSION
 from ds_cc_proxy.proxy import create_app

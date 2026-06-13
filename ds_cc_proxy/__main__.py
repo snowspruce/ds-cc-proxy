@@ -1,4 +1,4 @@
-# ds-cc-proxy CLI 入口
+# ds-cc-proxy CLI entry point
 
 
 import argparse
@@ -17,7 +17,7 @@ PIDFILE_DEFAULT = "/tmp/ds-cc-proxy.pid"
 
 
 def _stop(pidfile: str):
-    """停止代理：读取 PID 文件 → SIGTERM → 等待 → SIGKILL（超时则强制杀）。"""
+    """Stop the proxy: read PID → SIGTERM → wait → SIGKILL (force-kill on timeout)."""
     if not os.path.exists(pidfile):
         print(f"Proxy not running (PID file not found: {pidfile})")
         sys.exit(1)
@@ -75,10 +75,10 @@ def main():
     pidfile = args.pidfile
     pidfile_dir = os.path.dirname(pidfile) or "."
 
-    # 确保 PID 文件目录存在
+    # Ensure PID file directory exists
     os.makedirs(pidfile_dir, exist_ok=True)
 
-    # S5+S6: 原子创建 PID 文件，消除 TOCTOU 竞态，限制权限为 owner-only
+    # S5+S6: Atomic PID file creation — eliminates TOCTOU race, restricts permissions to owner-only
     try:
         pidfd = os.open(
             pidfile,
@@ -86,7 +86,7 @@ def main():
             stat.S_IRUSR | stat.S_IWUSR,
         )
     except FileExistsError:
-        # 文件已存在，检查进程是否存活
+        # PID file exists — check if process is still alive
         try:
             with open(pidfile) as f:
                 pid = int(f.read().strip())
@@ -94,7 +94,7 @@ def main():
             print(f"Proxy already running (PID {pid}), use --stop first")
             sys.exit(1)
         except (OSError, ValueError):
-            # 进程已死或 PID 文件损坏，清理后重试
+            # Process is dead or PID file is corrupt — clean up and retry
             os.unlink(pidfile)
             pidfd = os.open(
                 pidfile,

@@ -1,16 +1,16 @@
-# ds-cc-proxy / proxy — 核心代理逻辑
+# ds-cc-proxy / proxy — core proxy logic
 #
-# 环境变量:
-#   PROXY_UPSTREAM    DeepSeek API 地址 (默认 https://api.deepseek.com/anthropic)
-#   PROXY_HOST        监听地址 (默认 127.0.0.1)
-#   PROXY_PORT        监听端口 (默认 16889)
-#   PROXY_LOG_LEVEL   日志级别 (默认 warning)
-#   PROXY_LOG_FILE    日志文件路径 (默认空=仅 stdout)
-#   PROXY_LOG_MAX_BYTES  日志文件最大字节数 (默认 10MB)
-#   PROXY_LOG_BACKUP_COUNT 轮转备份数量 (默认 3)
-#   PROXY_DUMP_DIR    流量捕获目录 (默认空=关闭, ⚠ 含敏感数据)
+# Environment variables:
+#   PROXY_UPSTREAM    DeepSeek API base URL (default https://api.deepseek.com/anthropic)
+#   PROXY_HOST        Listen address (default 127.0.0.1)
+#   PROXY_PORT        Listen port (default 16889)
+#   PROXY_LOG_LEVEL   Log level (default warning)
+#   PROXY_LOG_FILE    Log file path (default empty = stdout only)
+#   PROXY_LOG_MAX_BYTES  Max log file size (default 10MB)
+#   PROXY_LOG_BACKUP_COUNT  Rotation backup count (default 3)
+#   PROXY_DUMP_DIR    Traffic capture dir (default empty = off, ⚠ contains secrets)
 #
-# 参考: https://api-docs.deepseek.com/guides/thinking_mode
+# Reference: https://api-docs.deepseek.com/guides/thinking_mode
 
 from __future__ import annotations
 
@@ -29,11 +29,11 @@ from starlette.routing import Route
 
 from ds_cc_proxy._version import VERSION
 
-# ---- 配置 ----
+# ---- Configuration ----
 
 DEEPSEEK_BASE = os.getenv("PROXY_UPSTREAM", "https://api.deepseek.com/anthropic")
 DEEPSEEK_FLASH = os.getenv("PROXY_FLASH_UPSTREAM", DEEPSEEK_BASE)
-FLASH_MODEL = os.getenv("PROXY_FLASH_MODEL", "")  # 子代理替换模型名，如 deepseek-v4-flash
+FLASH_MODEL = os.getenv("PROXY_FLASH_MODEL", "")  # sub-agent model override, e.g. deepseek-v4-flash
 HOST = os.getenv("PROXY_HOST", "127.0.0.1")
 try:
     PORT = int(os.getenv("PROXY_PORT", "16889"))
@@ -83,7 +83,7 @@ PROXY_UPSTREAM_TIMEOUT = _parse_env_float("PROXY_UPSTREAM_TIMEOUT", 600.0, min_v
 PROXY_CONNECT_TIMEOUT = _parse_env_float("PROXY_CONNECT_TIMEOUT", 10.0, min_val=1.0)
 MAX_BODY_BYTES = _parse_env_int("PROXY_MAX_BODY_BYTES", 10 * 1024 * 1024, min_val=1024)
 
-# 需要从客户端请求头中剥离的危险头
+# Dangerous hop-by-hop headers to strip from inbound requests
 _REQUEST_STRIP_HEADERS = {
     "host",
     "transfer-encoding",
@@ -97,7 +97,7 @@ _REQUEST_STRIP_HEADERS = {
     "keep-alive",
 }
 
-# SSE 流处理参数上限
+# SSE stream processing limits
 MAX_EVENT_TYPES = 50
 MAX_FILTERED_LINES = 200
 DUMP_PREVIEW_LINES = 30
@@ -130,7 +130,7 @@ logger = _app_logger
 _shared_client: httpx.AsyncClient | None = None
 
 
-# ---- httpx 客户端 ----
+# ---- httpx client ----
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -150,7 +150,7 @@ def _get_client() -> httpx.AsyncClient:
     return _shared_client
 
 
-# ---- 健康检查 ----
+# ---- Health check ----
 
 
 async def health(request):
@@ -163,7 +163,7 @@ async def health(request):
     )
 
 
-# ---- 修复 1: 请求端 thinking 注入 ----
+# ---- Fix 1: request-side thinking injection ----
 
 
 def _has_tool_use(content: list) -> bool:
@@ -203,7 +203,7 @@ def _inject_thinking_blocks(data: dict) -> bool:
     return modified
 
 
-# ---- 修复 2: thinking 模式标准化 ----
+# ---- Fix 2: thinking mode normalization ----
 
 
 def _normalize_thinking(data: dict) -> bool:
@@ -215,17 +215,18 @@ def _normalize_thinking(data: dict) -> bool:
 
     thinking_type = thinking_cfg.get("type", "")
 
-    # adaptive + effort=high → 主会话最优路径，不做任何修改
+    # adaptive — primary session optimal path, passthrough unchanged
     if thinking_type == "adaptive":
-        # 保留 output_config (effort=high)，DeepSeek v4 原生支持 adaptive
+        # Keep output_config (effort=high); DeepSeek V4 natively supports adaptive
         return False
 
-    # enabled → 合法，透传
+    # enabled — valid, passthrough
     if thinking_type == "enabled":
         return False
 
-    # disabled → 子代理硬编码值，DeepSeek v4 在某些请求下拒绝
-    # 转为 enabled + 最小预算（子代理不需要深度思考，但给足够推理空间保证质量）
+    # disabled — sub-agent hardcoded value, rejected by DeepSeek V4 on some requests
+    # Convert to enabled + minimal budget (sub-agents don't need deep thinking,
+    # but a small budget ensures sufficient reasoning quality)
     if thinking_type == "disabled":
         data["thinking"] = {"type": "enabled", "budget_tokens": 2048}
 
@@ -256,11 +257,11 @@ def _normalize_thinking(data: dict) -> bool:
         )
         return True
 
-    # 未知类型 → 不处理
+    # unknown type — leave unchanged
     return False
 
 
-# ---- 修复 3: 响应端 thinking 剥离 ----
+# ---- Fix 3: response-side thinking stripping ----
 
 
 def _thinking_requested(data: dict) -> bool:
@@ -300,7 +301,7 @@ def _filter_sse_line(line: str, thinking_indices: set) -> tuple:
     return line, thinking_indices
 
 
-# ---- 流量捕获 ----
+# ---- Traffic capture ----
 
 
 if DUMP_DIR:
@@ -349,7 +350,7 @@ def _summarize_request(data: dict) -> dict:
     }
 
 
-# ---- 请求处理 ----
+# ---- Request handling ----
 
 
 def _build_response_headers(upstream_resp, is_sse: bool) -> dict:
@@ -360,7 +361,7 @@ def _build_response_headers(upstream_resp, is_sse: bool) -> dict:
 
 
 async def proxy(request):
-    # S0: shutdown 期间拒绝新请求
+    # S0: reject new requests during shutdown
     if _shutting_down:
         return JSONResponse(
             {"error": {"message": "server shutting down", "type": "shutting_down"}},
@@ -371,7 +372,7 @@ async def proxy(request):
     method = request.method
     raw_path = request.url.path
 
-    # S1: 防止路径穿越
+    # S1: prevent path traversal
     if ".." in raw_path:
         logger.warning("[SEC] path traversal attempt: %s", raw_path)
         return JSONResponse(
@@ -382,12 +383,12 @@ async def proxy(request):
     path = "/" + raw_path.lstrip("/")
     upstream_url = f"{DEEPSEEK_BASE}{path}"
 
-    # S2: 剥离危险请求头
+    # S2: strip dangerous request headers
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _REQUEST_STRIP_HEADERS}
 
     is_messages = method == "POST" and path.rstrip("/").endswith("/messages")
 
-    # S9: 限制请求体大小
+    # S9: limit request body size
     if is_messages:
         content_length = request.headers.get("content-length")
         if content_length:
@@ -408,7 +409,7 @@ async def proxy(request):
 
     body = await request.body() if is_messages else b""
 
-    # S9: 双重检查实际 body 大小
+    # S9: double-check actual body size after read
     if is_messages and len(body) > MAX_BODY_BYTES:
         logger.warning("[SEC] request body exceeds limit after read: %d bytes", len(body))
         return JSONResponse(
@@ -430,7 +431,7 @@ async def proxy(request):
             logger.info("[REQ] %s", json.dumps(_summarize_request(data), ensure_ascii=False))
             _dump_json("last_request.json", data)
 
-            # 捕获原始 thinking 类型（_normalize_thinking 会原地修改）
+            # Capture original thinking type before _normalize_thinking mutates in-place
             thinking_cfg = data.get("thinking", {})
             is_subagent = (
                 isinstance(thinking_cfg, dict)
@@ -451,7 +452,7 @@ async def proxy(request):
                 logger.info("[STRIP] response filter enabled")
 
             if is_subagent:
-                # 子代理路由到 Flash 上游 + 替换模型名
+                # Sub-agent routing: switch to Flash upstream + override model name
                 upstream_url = f"{DEEPSEEK_FLASH}{path}"
                 if FLASH_MODEL:
                     data["model"] = FLASH_MODEL
@@ -562,7 +563,7 @@ async def proxy(request):
 
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
-                    # C1: 兼容 SSE 规范的 \r\n 行分隔符
+                    # C1: handle SSE \r\n line separators per spec
                     line = line.rstrip("\r")
 
                     if line.startswith("data: ") and len(event_types) < MAX_EVENT_TYPES:
@@ -579,7 +580,7 @@ async def proxy(request):
                             all_filtered.append(filtered)
                         yield (filtered + "\n").encode("utf-8")
 
-            # C1: 处理尾部缓冲区（同样 rstrip \r）
+            # C1: handle trailing buffer (rstrip \r as above)
             buffer = buffer.rstrip("\r")
             if buffer.strip():
                 if buffer.startswith("data: ") and len(event_types) < MAX_EVENT_TYPES:
@@ -618,7 +619,7 @@ async def proxy(request):
     )
 
 
-# ---- 应用工厂 ----
+# ---- Application factory ----
 
 _shutting_down = False
 
