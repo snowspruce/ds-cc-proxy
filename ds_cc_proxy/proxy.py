@@ -138,6 +138,53 @@ logger = _app_logger
 
 _shared_client: httpx.AsyncClient | None = None
 
+# ---- Usage tracking ----
+
+_usage = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read": 0}
+_usage_primary = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+_usage_subagent = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+
+
+def _track_usage(role: str, usage: dict):
+    global _usage, _usage_primary, _usage_subagent
+    inp = usage.get("input_tokens", 0)
+    out = usage.get("output_tokens", 0)
+    cr = usage.get("cache_read_input_tokens", 0)
+
+    _usage["requests"] += 1
+    _usage["input_tokens"] += inp
+    _usage["output_tokens"] += out
+    _usage["cache_read"] += cr
+
+    bucket = _usage_subagent if role == "subagent" else _usage_primary
+    bucket["requests"] += 1
+    bucket["input_tokens"] += inp
+    bucket["output_tokens"] += out
+
+
+async def usage_endpoint(request):
+    n = _usage["requests"]
+    inp = _usage["input_tokens"]
+    out = _usage["output_tokens"]
+    cache = _usage["cache_read"]
+    cacheable = inp + cache
+    hit_pct = (cache * 100 // cacheable) if cacheable > 0 else 0
+    # Rough cost estimate: DeepSeek V4 Pro ~$0.50/MTok input, ~$2.00/MTok output
+    est_cost = round(inp / 1_000_000 * 0.50 + out / 1_000_000 * 2.00, 3)
+
+    return JSONResponse(
+        {
+            "requests": n,
+            "input_tokens": inp,
+            "output_tokens": out,
+            "cache_hit_pct": hit_pct,
+            "estimated_cost_usd": est_cost,
+            "primary": None if not _usage_primary["requests"] else dict(_usage_primary),
+            "subagent": dict(_usage_subagent),
+        }
+    )
+
+
 # ---- Circuit breaker ----
 
 _circuit_state = "closed"  # closed | open | half_open
@@ -720,6 +767,7 @@ async def proxy(request):
                     cache_read,
                     hit_pct,
                 )
+                _track_usage(role, response_usage)
             _dump_json(
                 "last_response_events.json",
                 {
@@ -768,6 +816,7 @@ def create_app() -> Starlette:
         lifespan=lifespan,
         routes=[
             Route("/health", health, methods=["GET"]),
+            Route("/usage", usage_endpoint, methods=["GET"]),
             Route(
                 "/{path:path}",
                 proxy,

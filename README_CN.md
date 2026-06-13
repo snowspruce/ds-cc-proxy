@@ -64,6 +64,9 @@ ds-cc-proxy --stop            # 停止
 ```bash
 curl http://localhost:16889/health
 # {"status":"ok","version":"0.1.22","upstream":"https://api.deepseek.com/anthropic"}
+
+curl http://localhost:16889/usage
+# {"requests":247,"input_tokens":1200000,"output_tokens":340000,"estimated_cost_usd":0.87,...}
 ```
 
 ---
