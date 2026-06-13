@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsv4-cc-proxy"
+version = "1.9.0"
+description = "DeepSeek Anthropic API 兼容性代理 — 让 Claude Code 在 DeepSeek V4 模型上稳定运行"
+authors = [{name = "HosheaLi"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = ["deepseek", "claude", "proxy", "anthropic", "api"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: Proxy Servers",
+]
+dependencies = [
+    "httpx>=0.27.0",
+    "starlette>=0.37.0",
+    "uvicorn>=0.29.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "ruff>=0.4.0"]
+
+[project.urls]
+Homepage = "https://github.com/HosheaLi/P14_dsv4ToCC"
+Source = "https://github.com/HosheaLi/P14_dsv4ToCC"
+Documentation = "https://hosheali.github.io/P14_dsv4ToCC"
+
+[project.scripts]
+dsv4-cc-proxy = "dsv4_cc_proxy.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
