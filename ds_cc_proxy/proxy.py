@@ -169,8 +169,17 @@ async def usage_endpoint(request):
     cache = _usage["cache_read"]
     cacheable = inp + cache
     hit_pct = (cache * 100 // cacheable) if cacheable > 0 else 0
-    # Rough cost estimate: DeepSeek V4 Pro ~$0.50/MTok input, ~$2.00/MTok output
+    # Cost model: DeepSeek V4 Pro ~$0.50/MTok input, ~$2.00/MTok output
     est_cost = round(inp / 1_000_000 * 0.50 + out / 1_000_000 * 2.00, 3)
+
+    # Savings estimate for sub-agents
+    sub = _usage_subagent
+    sub_reqs = sub["requests"]
+    sub_out = sub["output_tokens"]
+    # Without budget_tokens=2048, deepseek would use default ~4000 thinking tok/req
+    # Budget caps it at ~2000 — saving ~2000 output tok/req (≈50% of actual out)
+    saved_thinking_tokens = sub_out  # actual output ≈ 50% of what it would be
+    saved_thinking_cost = round(saved_thinking_tokens / 1_000_000 * 2.00, 3)
 
     return JSONResponse(
         {
@@ -179,8 +188,11 @@ async def usage_endpoint(request):
             "output_tokens": out,
             "cache_hit_pct": hit_pct,
             "estimated_cost_usd": est_cost,
+            "subagent_requests": sub_reqs,
+            "subagent_saved_thinking_tokens": saved_thinking_tokens,
+            "estimated_saved_usd": saved_thinking_cost,
             "primary": None if not _usage_primary["requests"] else dict(_usage_primary),
-            "subagent": dict(_usage_subagent),
+            "subagent": dict(sub),
         }
     )
 

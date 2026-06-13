@@ -85,6 +85,7 @@ def main():
             print(f"Output:       {data['output_tokens']:,} tokens")
             print(f"Cache hit:    {data['cache_hit_pct']}%")
             print(f"Est. cost:    ${data['estimated_cost_usd']}")
+            print(f"Est. saved:   ${data['estimated_saved_usd']}")
             if data.get("primary"):
                 p = data["primary"]
                 pi, po = p["input_tokens"], p["output_tokens"]
@@ -92,6 +93,7 @@ def main():
             s = data["subagent"]
             si, so = s["input_tokens"], s["output_tokens"]
             print(f"  Sub-agent:  {s['requests']} reqs, {si:,}+{so:,} tok")
+            print(f"    ├ saved thinking: {data['subagent_saved_thinking_tokens']:,} tokens")
             return
         except Exception as e:
             print(f"Proxy not reachable at {HOST}:{PORT}: {e}")
