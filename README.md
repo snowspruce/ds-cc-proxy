@@ -2,6 +2,10 @@
 
 DeepSeek Anthropic API 兼容性代理 — 让 Claude Code 在 DeepSeek V4 模型上稳定运行。
 
+**只做 DeepSeek，做到极致。**
+
+> 与 [LiteLLM](https://github.com/BerriAI/litellm)、[Claude Code Router](https://github.com/musistudio/claude-code-router)、[OpenRouter](https://openrouter.ai/) 不同，ds-cc-proxy 不做通用多供应商路由。我们**专注 DeepSeek V4 + Claude Code 这一条链路**，在 thinking mode 协议适配、SSE 流解析容错、连接池管理、安全加固上深耕——这些是通用网关永远做不到位的细节。
+
 ```
 Claude Code ←→ localhost:16889 (ds-cc-proxy) ←→ api.deepseek.com/anthropic
 ```
@@ -106,7 +110,7 @@ ds-cc-proxy --stop
 
 ```bash
 curl http://localhost:16889/health
-# {"status":"ok","version":"1.9.0","upstream":"https://api.deepseek.com/anthropic"}
+# {"status":"ok","version":"0.1.22","upstream":"https://api.deepseek.com/anthropic"}
 ```
 
 ## 与本地代理的关系
@@ -117,6 +121,22 @@ ds-cc-proxy 监听 `127.0.0.1:16889`，仅处理 Claude Code 通过 `ANTHROPIC_B
 - **ds-cc-proxy**：应用层代理，Claude Code 直连 `localhost:16889`，不经过系统代理
 
 两者工作在不同网络层，可同时运行，无需任何特殊配置。
+
+## 与同类工具的对比
+
+| | **ds-cc-proxy** | LiteLLM | Claude Code Router | OpenRouter |
+|---|---|---|---|---|
+| 定位 | DeepSeek 专项 | 通用企业网关 | 多供应商路由 | 托管聚合平台 |
+| 语言 / 体量 | Python ~650 LOC | Python ~10K+ LOC | Node.js ~5K+ LOC | SaaS，无需部署 |
+| DeepSeek thinking 注入 | ✅ 专项适配 | ⚠️ 部分 | ❌ 需 transformer 插件 | ❌ |
+| adaptive 透传 | ✅ 原生 | ❌ | ❌ | ❌ |
+| SSE 流解析容错 | ✅ 多重守卫 | ✅ | ⚠️ 通用处理 | ❌ |
+| 安全加固 | ✅ 12 项 | ✅ 企业级 | ⚠️ 基础 | N/A（托管） |
+| 部署 | `pip install` 一条命令 | YAML 配置 + 启动 | `npm install -g` + JSON | 注册 + API Key |
+
+**什么时候选 ds-cc-proxy**：你的主模型是 DeepSeek，需要 Claude Code 稳定运行，不想折腾复杂配置。
+
+**什么时候选 LiteLLM / CCR / OpenRouter**：需要同时在多个供应商之间切换、需要企业级 RBAC/审计、或者不需要 DeepSeek thinking 专项优化。
 
 ## 许可证
 
