@@ -11,7 +11,7 @@ import time
 import uvicorn
 
 from ds_cc_proxy._version import VERSION
-from ds_cc_proxy.proxy import DUMP_DIR, HOST, LOG_LEVEL, PORT
+from ds_cc_proxy.proxy import DUMP_DIR, HOST, LOG_LEVEL, PORT, create_app
 
 PIDFILE_DEFAULT = "/tmp/ds-cc-proxy.pid"
 
@@ -60,11 +60,10 @@ def _stop(pidfile: str):
 
 def main():
     parser = argparse.ArgumentParser(description="DeepSeek Thinking Proxy")
+    parser.add_argument("--stop", action="store_true", help="Stop running proxy")
     parser.add_argument(
-        "--stop", action="store_true", help="Stop running proxy"
-    )
-    parser.add_argument(
-        "--pidfile", default=PIDFILE_DEFAULT,
+        "--pidfile",
+        default=PIDFILE_DEFAULT,
         help=f"PID file path (default: {PIDFILE_DEFAULT})",
     )
     args = parser.parse_args()
@@ -81,7 +80,11 @@ def main():
 
     # S5+S6: 原子创建 PID 文件，消除 TOCTOU 竞态，限制权限为 owner-only
     try:
-        pidfd = os.open(pidfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, stat.S_IRUSR | stat.S_IWUSR)
+        pidfd = os.open(
+            pidfile,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
     except FileExistsError:
         # 文件已存在，检查进程是否存活
         try:
@@ -93,7 +96,11 @@ def main():
         except (OSError, ValueError):
             # 进程已死或 PID 文件损坏，清理后重试
             os.unlink(pidfile)
-            pidfd = os.open(pidfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, stat.S_IRUSR | stat.S_IWUSR)
+            pidfd = os.open(
+                pidfile,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
 
     with os.fdopen(pidfd, "w") as f:
         f.write(str(os.getpid()))
@@ -103,7 +110,7 @@ def main():
         print(f"⚠ DUMP mode: {DUMP_DIR}")
     try:
         uvicorn.run(
-            "ds_cc_proxy.proxy:create_app",
+            create_app,
             host=HOST,
             port=PORT,
             log_level=LOG_LEVEL,

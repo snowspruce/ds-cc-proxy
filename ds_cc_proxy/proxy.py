@@ -14,12 +14,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import logging.handlers
 import os
 import sys
-import asyncio
 from contextlib import asynccontextmanager
 
 import httpx
@@ -83,9 +83,16 @@ MAX_BODY_BYTES = _parse_env_int("PROXY_MAX_BODY_BYTES", 10 * 1024 * 1024, min_va
 
 # 需要从客户端请求头中剥离的危险头
 _REQUEST_STRIP_HEADERS = {
-    "host", "transfer-encoding", "connection", "upgrade",
-    "proxy-authorization", "proxy-connection", "proxy-authenticate",
-    "te", "trailer", "keep-alive",
+    "host",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-connection",
+    "proxy-authenticate",
+    "te",
+    "trailer",
+    "keep-alive",
 }
 
 # SSE 流处理参数上限
@@ -145,26 +152,25 @@ def _get_client() -> httpx.AsyncClient:
 
 
 async def health(request):
-    return JSONResponse({
-        "status": "ok",
-        "version": VERSION,
-        "upstream": DEEPSEEK_BASE,
-    })
+    return JSONResponse(
+        {
+            "status": "ok",
+            "version": VERSION,
+            "upstream": DEEPSEEK_BASE,
+        }
+    )
 
 
 # ---- 修复 1: 请求端 thinking 注入 ----
 
 
 def _has_tool_use(content: list) -> bool:
-    return any(
-        isinstance(b, dict) and b.get("type") == "tool_use" for b in content
-    )
+    return any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
 
 
 def _has_thinking(content: list) -> bool:
     return any(
-        isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")
-        for b in content
+        isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking") for b in content
     )
 
 
@@ -234,7 +240,8 @@ def _normalize_thinking(data: dict) -> bool:
             if not isinstance(content, list):
                 continue
             new_content = [
-                b for b in content
+                b
+                for b in content
                 if not (isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))
             ]
             if len(new_content) != len(content):
@@ -256,10 +263,7 @@ def _normalize_thinking(data: dict) -> bool:
 
 def _thinking_requested(data: dict) -> bool:
     thinking_cfg = data.get("thinking", {})
-    return (
-        isinstance(thinking_cfg, dict)
-        and thinking_cfg.get("type") in ("enabled", "adaptive")
-    )
+    return isinstance(thinking_cfg, dict) and thinking_cfg.get("type") in ("enabled", "adaptive")
 
 
 def _filter_sse_line(line: str, thinking_indices: set) -> tuple:
@@ -314,7 +318,7 @@ def _dump_json(filename: str, data):
         path = os.path.join(DUMP_DIR, filename)
         s = json.dumps(data, ensure_ascii=False, indent=2, default=str)
         if len(s) > DUMP_MAX_BYTES:
-            s = s[:DUMP_MAX_BYTES] + "\n\n... [TRUNCATED at {}KB]".format(DUMP_MAX_BYTES // 1000)
+            s = s[:DUMP_MAX_BYTES] + f"\n\n... [TRUNCATED at {DUMP_MAX_BYTES // 1000}KB]"
         with open(path, "w") as f:
             f.write(s)
         logger.info("[DUMP] %s (%d bytes)", filename, len(s))
@@ -327,10 +331,7 @@ def _summarize_request(data: dict) -> dict:
     tools = data.get("tools", [])
     system = data.get("system", "")
     if isinstance(system, list):
-        system = " ".join(
-            b.get("text", "") if isinstance(b, dict) else str(b)
-            for b in system[:2]
-        )
+        system = " ".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in system[:2])
     return {
         "model": data.get("model", "?"),
         "stream": data.get("stream", False),
@@ -353,13 +354,18 @@ def _build_response_headers(upstream_resp, is_sse: bool) -> dict:
     strip_keys = {"transfer-encoding"}
     if is_sse:
         strip_keys.add("content-length")
-    return {
-        k: v for k, v in upstream_resp.headers.items()
-        if k.lower() not in strip_keys
-    }
+    return {k: v for k, v in upstream_resp.headers.items() if k.lower() not in strip_keys}
 
 
 async def proxy(request):
+    # S0: shutdown 期间拒绝新请求
+    if _shutting_down:
+        return JSONResponse(
+            {"error": {"message": "server shutting down", "type": "shutting_down"}},
+            status_code=503,
+            headers={"Retry-After": "10"},
+        )
+
     method = request.method
     raw_path = request.url.path
 
@@ -375,10 +381,9 @@ async def proxy(request):
     upstream_url = f"{DEEPSEEK_BASE}{path}"
 
     # S2: 剥离危险请求头
-    headers = {k: v for k, v in request.headers.items()
-               if k.lower() not in _REQUEST_STRIP_HEADERS}
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in _REQUEST_STRIP_HEADERS}
 
-    is_messages = (method == "POST" and path.rstrip("/").endswith("/messages"))
+    is_messages = method == "POST" and path.rstrip("/").endswith("/messages")
 
     # S9: 限制请求体大小
     if is_messages:
@@ -388,7 +393,12 @@ async def proxy(request):
                 if int(content_length) > MAX_BODY_BYTES:
                     logger.warning("[SEC] request body too large: %s bytes", content_length)
                     return JSONResponse(
-                        {"error": {"message": "request body too large", "type": "payload_too_large"}},
+                        {
+                            "error": {
+                                "message": "request body too large",
+                                "type": "payload_too_large",
+                            }
+                        },
                         status_code=413,
                     )
             except (TypeError, ValueError):
@@ -400,7 +410,12 @@ async def proxy(request):
     if is_messages and len(body) > MAX_BODY_BYTES:
         logger.warning("[SEC] request body exceeds limit after read: %d bytes", len(body))
         return JSONResponse(
-            {"error": {"message": "request body too large", "type": "payload_too_large"}},
+            {
+                "error": {
+                    "message": "request body too large",
+                    "type": "payload_too_large",
+                }
+            },
             status_code=413,
         )
 
@@ -433,6 +448,8 @@ async def proxy(request):
 
         except json.JSONDecodeError:
             logger.warning("[REQ] invalid JSON body, forwarding as-is")
+        except (KeyError, TypeError):
+            logger.exception("[REQ] unexpected body structure, forwarding as-is")
 
     client = _get_client()
 
@@ -485,6 +502,7 @@ async def proxy(request):
         )
 
     if not strip_thinking or not is_sse:
+
         async def passthrough():
             try:
                 async for chunk in upstream_resp.aiter_bytes():
@@ -510,13 +528,13 @@ async def proxy(request):
         event_types = []
         all_filtered = []
         buffer = ""
-        MAX_BUFFER_BYTES = 1024 * 1024  # 1MB
+        max_buffer_bytes = 1024 * 1024  # 1MB
 
         try:
             async for chunk in upstream_resp.aiter_bytes():
                 text = chunk.decode("utf-8", errors="replace")
                 buffer += text
-                if len(buffer) > MAX_BUFFER_BYTES:
+                if len(buffer) > max_buffer_bytes:
                     logger.warning("[FILTER] SSE buffer overflow, truncating")
                     # Flush buffer as-is and reset
                     yield buffer.encode("utf-8")
@@ -525,6 +543,8 @@ async def proxy(request):
 
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
+                    # C1: 兼容 SSE 规范的 \r\n 行分隔符
+                    line = line.rstrip("\r")
 
                     if line.startswith("data: ") and len(event_types) < MAX_EVENT_TYPES:
                         try:
@@ -540,6 +560,8 @@ async def proxy(request):
                             all_filtered.append(filtered)
                         yield (filtered + "\n").encode("utf-8")
 
+            # C1: 处理尾部缓冲区（同样 rstrip \r）
+            buffer = buffer.rstrip("\r")
             if buffer.strip():
                 if buffer.startswith("data: ") and len(event_types) < MAX_EVENT_TYPES:
                     try:
@@ -557,11 +579,14 @@ async def proxy(request):
         finally:
             logger.info("[RESP-EVENTS] raw=%s", event_types[:LOG_EVENT_PREVIEW])
             logger.info("[RESP-FILTERED] lines=%d", len(all_filtered))
-            _dump_json("last_response_events.json", {
-                "raw_events": event_types,
-                "filtered_count": len(all_filtered),
-                "first_filtered": all_filtered[:DUMP_PREVIEW_LINES],
-            })
+            _dump_json(
+                "last_response_events.json",
+                {
+                    "raw_events": event_types,
+                    "filtered_count": len(all_filtered),
+                    "first_filtered": all_filtered[:DUMP_PREVIEW_LINES],
+                },
+            )
             try:
                 await upstream_resp.aclose()
             except Exception:
@@ -601,6 +626,10 @@ def create_app() -> Starlette:
         lifespan=lifespan,
         routes=[
             Route("/health", health, methods=["GET"]),
-            Route("/{path:path}", proxy, methods=["POST"]),
+            Route(
+                "/{path:path}",
+                proxy,
+                methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+            ),
         ],
     )
