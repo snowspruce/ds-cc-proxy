@@ -15,7 +15,7 @@ Claude Code ←→ localhost:16889 (ds-cc-proxy) ←→ api.deepseek.com/anthrop
 **如果你正在运行 `dsv4-cc-proxy`**：两者功能兼容，`ds-cc-proxy` 是其后继版本，增加了大量安全加固和鲁棒性修复（见下表）。升级时只需：
 ```bash
 pip uninstall dsv4-cc-proxy
-pip install git+https://github.com/snowspruce/ds-cc-proxy.git
+pip install ds-cc-proxy
 # CLI 命令变为 ds-cc-proxy（原 dsv4-cc-proxy 不再可用）
 ```
 
@@ -65,7 +65,11 @@ pip install git+https://github.com/snowspruce/ds-cc-proxy.git
 ## 快速开始
 
 ```bash
-pip install git+https://github.com/snowspruce/ds-cc-proxy.git
+pip install ds-cc-proxy
+
+# 或隔离安装
+pipx install ds-cc-proxy
+uv tool install ds-cc-proxy
 
 # 启动代理
 ds-cc-proxy
