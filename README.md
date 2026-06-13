@@ -128,6 +128,8 @@ ds-cc-proxy 监听 `127.0.0.1:16889`，仅处理 Claude Code 通过 `ANTHROPIC_B
 |---|---|---|---|---|
 | 定位 | DeepSeek 专项 | 通用企业网关 | 多供应商路由 | 托管聚合平台 |
 | 语言 / 体量 | Python ~650 LOC | Python ~10K+ LOC | Node.js ~5K+ LOC | SaaS，无需部署 |
+| 依赖数 | 3 | 50+ | 80+（npm 树） | N/A |
+| 可审计性 | ✅ 10 分钟通读 | ❌ 需数天 | ❌ 需半天 | ❌ 闭源 |
 | DeepSeek thinking 注入 | ✅ 专项适配 | ⚠️ 部分 | ❌ 需 transformer 插件 | ❌ |
 | adaptive 透传 | ✅ 原生 | ❌ | ❌ | ❌ |
 | SSE 流解析容错 | ✅ 多重守卫 | ✅ | ⚠️ 通用处理 | ❌ |
