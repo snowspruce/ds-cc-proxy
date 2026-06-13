@@ -1,14 +1,17 @@
 # ds-cc-proxy / proxy — core proxy logic
 #
 # Environment variables:
-#   PROXY_UPSTREAM    DeepSeek API base URL (default https://api.deepseek.com/anthropic)
-#   PROXY_HOST        Listen address (default 127.0.0.1)
-#   PROXY_PORT        Listen port (default 16889)
-#   PROXY_LOG_LEVEL   Log level (default warning)
-#   PROXY_LOG_FILE    Log file path (default empty = stdout only)
-#   PROXY_LOG_MAX_BYTES  Max log file size (default 10MB)
-#   PROXY_LOG_BACKUP_COUNT  Rotation backup count (default 3)
-#   PROXY_DUMP_DIR    Traffic capture dir (default empty = off, ⚠ contains secrets)
+#   PROXY_UPSTREAM         DeepSeek API base URL (default https://api.deepseek.com/anthropic)
+#   PROXY_FLASH_UPSTREAM   Sub-agent Flash upstream URL (default same as PROXY_UPSTREAM)
+#   PROXY_FLASH_MODEL      Sub-agent model override, e.g. deepseek-v4-flash (default empty)
+#   PROXY_HOST             Listen address (default 127.0.0.1)
+#   PROXY_PORT             Listen port (default 16889)
+#   PROXY_LOG_LEVEL        Log level (default warning)
+#   PROXY_LOG_FILE         Log file path (default empty = stdout only)
+#   PROXY_LOG_MAX_BYTES    Max log file size (default 10MB)
+#   PROXY_LOG_BACKUP_COUNT Rotation backup count (default 3)
+#   PROXY_MAX_BODY_BYTES   Max request body size (default 10MB)
+#   PROXY_DUMP_DIR         Traffic capture dir (default empty = off, ⚠ contains secrets)
 #
 # Reference: https://api-docs.deepseek.com/guides/thinking_mode
 
@@ -269,7 +272,12 @@ def _thinking_requested(data: dict) -> bool:
     return isinstance(thinking_cfg, dict) and thinking_cfg.get("type") in ("enabled", "adaptive")
 
 
-def _filter_sse_line(line: str, thinking_indices: set) -> tuple:
+def _process_sse_data_line(line: str, thinking_indices: set, event_types: list, response_usage: dict) -> tuple:
+    """Parse and process a ``data:`` SSE line — track event types and filter thinking blocks.
+
+    Parses JSON once, then performs both event-type tracking and thinking-index management.
+    Returns ``(filtered_line_or_None, thinking_indices)``.
+    """
     if not line.startswith("data: "):
         return line, thinking_indices
 
@@ -283,6 +291,15 @@ def _filter_sse_line(line: str, thinking_indices: set) -> tuple:
 
     t = data.get("type", "")
 
+    # Event type tracking
+    if len(event_types) < MAX_EVENT_TYPES:
+        event_types.append(t if t else "?")
+    if t in ("message_stop", "message_delta"):
+        u = data.get("usage")
+        if isinstance(u, dict):
+            response_usage.update(u)
+
+    # Thinking block filtering
     if t == "content_block_start":
         cb = data.get("content_block", {})
         if cb.get("type") == "thinking":
@@ -299,26 +316,6 @@ def _filter_sse_line(line: str, thinking_indices: set) -> tuple:
             return None, thinking_indices
 
     return line, thinking_indices
-
-
-def _track_event_type(line: str, event_types: list, response_usage: dict) -> None:
-    """Extract event type and usage from a ``data:`` SSE line."""
-    if not line.startswith("data: "):
-        return
-    if len(event_types) >= MAX_EVENT_TYPES:
-        return
-    try:
-        d = json.loads(line[6:])
-    except json.JSONDecodeError:
-        return
-    if not isinstance(d, dict):
-        return
-    t = d.get("type", "?")
-    event_types.append(t)
-    if t in ("message_stop", "message_delta"):
-        u = d.get("usage")
-        if isinstance(u, dict):
-            response_usage.update(u)
 
 
 # ---- Traffic capture ----
@@ -588,10 +585,9 @@ async def proxy(request):
                     line, buffer = buffer.split("\n", 1)
                     line = line.rstrip("\r")  # C1: handle SSE \r\n per spec
 
-                    if line.startswith("data: "):
-                        _track_event_type(line, event_types, response_usage)
-
-                    filtered, thinking_indices = _filter_sse_line(line, thinking_indices)
+                    filtered, thinking_indices = _process_sse_data_line(
+                        line, thinking_indices, event_types, response_usage
+                    )
                     if filtered is not None:
                         if len(all_filtered) < MAX_FILTERED_LINES:
                             all_filtered.append(filtered)
@@ -600,9 +596,9 @@ async def proxy(request):
             # C1: handle trailing buffer (rstrip \r as above)
             buffer = buffer.rstrip("\r")
             if buffer.strip():
-                if buffer.startswith("data: "):
-                    _track_event_type(buffer, event_types, response_usage)
-                filtered, thinking_indices = _filter_sse_line(buffer, thinking_indices)
+                filtered, thinking_indices = _process_sse_data_line(
+                    buffer, thinking_indices, event_types, response_usage
+                )
                 if filtered is not None:
                     yield (filtered + "\n").encode("utf-8")
 

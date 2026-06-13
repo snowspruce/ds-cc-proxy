@@ -10,13 +10,13 @@ from unittest.mock import MagicMock
 
 from ds_cc_proxy.proxy import (
     _build_response_headers,
-    _filter_sse_line,
     _has_thinking,
     _has_tool_use,
     _inject_thinking_blocks,
     _normalize_thinking,
     _parse_env_float,
     _parse_env_int,
+    _process_sse_data_line,
     _summarize_request,
     _thinking_requested,
 )
@@ -325,25 +325,27 @@ class TestThinkingRequested:
 
 
 # ---------------------------------------------------------------------------
-# _filter_sse_line
+# _process_sse_data_line
 # ---------------------------------------------------------------------------
 
 
-class TestFilterSseLine:
+class TestProcessSseDataLine:
+    # --- thinking filtering (legacy _filter_sse_line behavior) ---
+
     def test_passthrough_non_data_line(self):
         line = "event: message"
-        result, indices = _filter_sse_line(line, set())
+        result, indices = _process_sse_data_line(line, set(), [], {})
         assert result == line
         assert indices == set()
 
     def test_passthrough_non_thinking_event(self):
         line = 'data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}'
-        result, indices = _filter_sse_line(line, set())
+        result, indices = _process_sse_data_line(line, set(), [], {})
         assert result == line
 
     def test_filters_thinking_start(self):
         line = 'data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}'
-        result, indices = _filter_sse_line(line, set())
+        result, indices = _process_sse_data_line(line, set(), [], {})
         assert result is None
         assert 1 in indices
 
@@ -353,14 +355,14 @@ class TestFilterSseLine:
             'data: {"type":"content_block_delta","index":1,'
             '"delta":{"type":"thinking_delta","thinking":"x"}}'
         )
-        result, indices = _filter_sse_line(line, indices)
+        result, indices = _process_sse_data_line(line, indices, [], {})
         assert result is None
         assert 1 in indices
 
     def test_clears_on_stop(self):
         indices = {1}
         line = 'data: {"type":"content_block_stop","index":1}'
-        result, indices = _filter_sse_line(line, indices)
+        result, indices = _process_sse_data_line(line, indices, [], {})
         assert result is None
         assert 1 not in indices
 
@@ -370,26 +372,68 @@ class TestFilterSseLine:
             'data: {"type":"content_block_delta","index":2,'
             '"delta":{"type":"text_delta","text":"hi"}}'
         )
-        result, indices = _filter_sse_line(line, indices)
+        result, indices = _process_sse_data_line(line, indices, [], {})
         assert result == line
 
     def test_handles_invalid_json(self):
         line = "data: not valid json"
-        result, indices = _filter_sse_line(line, set())
+        result, indices = _process_sse_data_line(line, set(), [], {})
         assert result == line
 
     def test_handles_non_dict_data(self):
         line = "data: [1, 2, 3]"
-        result, indices = _filter_sse_line(line, set())
+        result, indices = _process_sse_data_line(line, set(), [], {})
         assert result == line
 
     def test_rstripped_line(self):
-        """C1: verify trailing \r is handled before _filter_sse_line."""
+        """C1: verify trailing \r is handled before _process_sse_data_line."""
         line = 'data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}'
-        # Simulating what happens after rstrip('\r') in filtered_stream
         clean = line.rstrip("\r")
-        result, _ = _filter_sse_line(clean, set())
+        result, _ = _process_sse_data_line(clean, set(), [], {})
         assert result == clean
+
+    # --- event type tracking (legacy _track_event_type behavior) ---
+
+    def test_tracks_event_type(self):
+        event_types = []
+        line = 'data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}'
+        _process_sse_data_line(line, set(), event_types, {})
+        assert event_types == ["content_block_start"]
+
+    def test_tracks_unknown_type_as_question(self):
+        event_types = []
+        line = 'data: {"index":0}'
+        _process_sse_data_line(line, set(), event_types, {})
+        assert event_types == ["?"]
+
+    def test_tracks_usage_from_message_stop(self):
+        response_usage = {}
+        line = 'data: {"type":"message_stop","usage":{"input_tokens":10,"output_tokens":20}}'
+        _process_sse_data_line(line, set(), [], response_usage)
+        assert response_usage == {"input_tokens": 10, "output_tokens": 20}
+
+    def test_tracks_usage_from_message_delta(self):
+        response_usage = {}
+        line = 'data: {"type":"message_delta","usage":{"output_tokens":5}}'
+        _process_sse_data_line(line, set(), [], response_usage)
+        assert response_usage == {"output_tokens": 5}
+
+    def test_event_types_respects_max(self):
+        """MAX_EVENT_TYPES is a module-level limit; test that we don't exceed it."""
+        event_types = []
+        for i in range(100):
+            line = f'data: {{"type":"event_{i}","index":0}}'
+            _process_sse_data_line(line, set(), event_types, {})
+        # MAX_EVENT_TYPES is 50, so we should have at most 50
+        assert len(event_types) <= 50
+
+    def test_json_parsed_once(self):
+        """Verify that a single line is parsed only once (merged function)."""
+        event_types = []
+        line = 'data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}'
+        _process_sse_data_line(line, set(), event_types, {})
+        # If JSON were parsed twice, this line would be added twice
+        assert event_types == ["content_block_start"]
 
 
 # ---------------------------------------------------------------------------

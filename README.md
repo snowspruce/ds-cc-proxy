@@ -83,6 +83,7 @@ curl http://localhost:16889/health
 | `PROXY_POOL_TIMEOUT` | `120.0` | Pool queue timeout (seconds) |
 | `PROXY_UPSTREAM_TIMEOUT` | `600.0` | Per-request upstream timeout (seconds) |
 | `PROXY_CONNECT_TIMEOUT` | `10.0` | TCP connect timeout (seconds) |
+| `PROXY_MAX_BODY_BYTES` | `10485760` | Max request body size (10MB) |
 | `PROXY_DUMP_DIR` | *(empty)* | Traffic dump (contains secrets, debug only) |
 
 ---
