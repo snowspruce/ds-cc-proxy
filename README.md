@@ -84,7 +84,19 @@ curl http://localhost:16889/health
 | `PROXY_UPSTREAM_TIMEOUT` | `600.0` | Per-request upstream timeout (seconds) |
 | `PROXY_CONNECT_TIMEOUT` | `10.0` | TCP connect timeout (seconds) |
 | `PROXY_MAX_BODY_BYTES` | `10485760` | Max request body size (10MB) |
+| `PROXY_RETRY_MAX` | `3` | Max retry attempts on transient failures |
+| `PROXY_RETRY_BACKOFF` | `1.0` | Base backoff seconds per retry (exponential) |
+| `PROXY_CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures before circuit opens |
+| `PROXY_CIRCUIT_BREAKER_TIMEOUT` | `30.0` | Seconds circuit stays open before half-open trial |
 | `PROXY_DUMP_DIR` | *(empty)* | Traffic dump (contains secrets, debug only) |
+
+### Reliability · Retry + Circuit Breaker
+
+Transient failures (network blips, 502/503) are retried automatically with exponential backoff. After `PROXY_CIRCUIT_BREAKER_THRESHOLD` consecutive failures, the circuit opens — all requests immediately return 503 until a half-open trial succeeds. No more cascading timeouts.
+
+### Caching · Prompt Cache Hints
+
+`cache_control: ephemeral` breakpoints are injected on system prompts and the last message of each request. DeepSeek caches the matching prefix — subsequent requests with the same prefix pay only 10% for cached input tokens. Transparent to Claude Code; check `[COST]` logs for `cache_hit%`.
 
 ---
 

@@ -12,6 +12,7 @@ from ds_cc_proxy.proxy import (
     _build_response_headers,
     _has_thinking,
     _has_tool_use,
+    _inject_cache_control,
     _inject_thinking_blocks,
     _normalize_thinking,
     _parse_env_float,
@@ -540,3 +541,61 @@ class TestSummarizeRequest:
         tools = [{"name": f"tool_{i}"} for i in range(15)]
         summary = _summarize_request({"tools": tools, "messages": []})
         assert len(summary["tool_names"]) == 10
+
+
+# ---------------------------------------------------------------------------
+# _inject_cache_control
+# ---------------------------------------------------------------------------
+
+
+class TestInjectCacheControl:
+    def test_marks_string_system_prompt(self):
+        data = {"system": "You are helpful", "messages": []}
+        assert _inject_cache_control(data) is True
+        assert data["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_marks_list_system_last_block(self):
+        data = {
+            "system": [{"type": "text", "text": "sys1"}, {"type": "text", "text": "sys2"}],
+            "messages": [],
+        }
+        assert _inject_cache_control(data) is True
+        assert data["system"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert "cache_control" not in data["system"][0]
+
+    def test_marks_last_message_content(self):
+        data = {
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "user", "content": [{"type": "text", "text": "world"}]},
+            ],
+        }
+        assert _inject_cache_control(data) is True
+        assert data["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_converts_string_content_for_cache(self):
+        data = {"messages": [{"role": "user", "content": "hello"}]}
+        assert _inject_cache_control(data) is True
+        assert isinstance(data["messages"][-1]["content"], list)
+        assert data["messages"][-1]["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_no_duplicate_cache_markers(self):
+        data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}
+                    ],
+                },
+            ],
+        }
+        assert _inject_cache_control(data) is False
+
+    def test_empty_input_unchanged(self):
+        data = {}
+        assert _inject_cache_control(data) is False
+
+    def test_skips_system_none(self):
+        data = {"system": None, "messages": [{"role": "user", "content": "hi"}]}
+        assert _inject_cache_control(data) is True  # still marks the last message

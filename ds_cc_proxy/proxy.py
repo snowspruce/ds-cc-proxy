@@ -22,7 +22,9 @@ import json
 import logging
 import logging.handlers
 import os
+import random as _random
 import sys
+import time as _time
 from contextlib import asynccontextmanager
 
 import httpx
@@ -85,6 +87,10 @@ PROXY_POOL_TIMEOUT = _parse_env_float("PROXY_POOL_TIMEOUT", 120.0, min_val=1.0)
 PROXY_UPSTREAM_TIMEOUT = _parse_env_float("PROXY_UPSTREAM_TIMEOUT", 600.0, min_val=1.0)
 PROXY_CONNECT_TIMEOUT = _parse_env_float("PROXY_CONNECT_TIMEOUT", 10.0, min_val=1.0)
 MAX_BODY_BYTES = _parse_env_int("PROXY_MAX_BODY_BYTES", 10 * 1024 * 1024, min_val=1024)
+RETRY_MAX = _parse_env_int("PROXY_RETRY_MAX", 3, min_val=0)
+RETRY_BACKOFF = _parse_env_float("PROXY_RETRY_BACKOFF", 1.0, min_val=0.1)
+CB_THRESHOLD = _parse_env_int("PROXY_CIRCUIT_BREAKER_THRESHOLD", 5, min_val=1)
+CB_TIMEOUT = _parse_env_float("PROXY_CIRCUIT_BREAKER_TIMEOUT", 30.0, min_val=5.0)
 
 # Dangerous hop-by-hop headers to strip from inbound requests
 _REQUEST_STRIP_HEADERS = {
@@ -131,6 +137,59 @@ if LOG_FILE:
 logger = _app_logger
 
 _shared_client: httpx.AsyncClient | None = None
+
+# ---- Circuit breaker ----
+
+_circuit_state = "closed"  # closed | open | half_open
+_circuit_failures = 0
+_circuit_opened_at = 0.0
+
+_RETRYABLE_STATUS = {429, 502, 503}
+_RETRYABLE_EXCEPTIONS = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+)
+
+
+def _circuit_allow() -> bool:
+    """Return True if the circuit allows a request through."""
+    global _circuit_state, _circuit_failures, _circuit_opened_at
+    if _circuit_state == "closed":
+        return True
+    if _circuit_state == "open":
+        if _time.monotonic() - _circuit_opened_at >= CB_TIMEOUT:
+            _circuit_state = "half_open"
+            logger.warning("[CB] circuit half-open — allowing trial request")
+            return True
+        return False
+    # half_open — allow one trial
+    return True
+
+
+def _circuit_success():
+    global _circuit_state, _circuit_failures
+    if _circuit_state == "half_open":
+        _circuit_state = "closed"
+        _circuit_failures = 0
+        logger.info("[CB] circuit closed — upstream recovered")
+    elif _circuit_state == "closed":
+        _circuit_failures = 0
+
+
+def _circuit_failure():
+    global _circuit_state, _circuit_failures, _circuit_opened_at
+    _circuit_failures += 1
+    if _circuit_state == "half_open" or (
+        _circuit_state == "closed" and _circuit_failures >= CB_THRESHOLD
+    ):
+        _circuit_state = "open"
+        _circuit_opened_at = _time.monotonic()
+        logger.warning(
+            "[CB] circuit open — %d consecutive failures, blocking for %.0fs",
+            _circuit_failures,
+            CB_TIMEOUT,
+        )
 
 
 # ---- httpx client ----
@@ -272,7 +331,54 @@ def _thinking_requested(data: dict) -> bool:
     return isinstance(thinking_cfg, dict) and thinking_cfg.get("type") in ("enabled", "adaptive")
 
 
-def _process_sse_data_line(line: str, thinking_indices: set, event_types: list, response_usage: dict) -> tuple:
+# ---- Fix 4: prompt cache hints ----
+
+
+def _inject_cache_control(data: dict) -> bool:
+    """Mark cacheable content with ``cache_control`` breakpoints for DeepSeek prompt caching.
+
+    Inserts ``{"type": "ephemeral"}`` markers on:
+    - System prompt (string or content-block form)
+    - Last message in the conversation
+
+    Returns True if any marker was injected.
+    """
+    modified = False
+
+    # Mark system prompt
+    system = data.get("system")
+    if isinstance(system, str) and system:
+        data["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        modified = True
+    elif isinstance(system, list) and system:
+        last = system[-1]
+        if isinstance(last, dict) and "cache_control" not in last:
+            last["cache_control"] = {"type": "ephemeral"}
+            modified = True
+
+    # Mark last message in the conversation
+    messages = data.get("messages")
+    if isinstance(messages, list) and messages:
+        last_msg = messages[-1]
+        if isinstance(last_msg, dict):
+            content = last_msg.get("content")
+            if isinstance(content, list) and content:
+                last_block = content[-1]
+                if isinstance(last_block, dict) and "cache_control" not in last_block:
+                    last_block["cache_control"] = {"type": "ephemeral"}
+                    modified = True
+            elif isinstance(content, str) and content:
+                last_msg["content"] = [
+                    {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+                ]
+                modified = True
+
+    return modified
+
+
+def _process_sse_data_line(
+    line: str, thinking_indices: set, event_types: list, response_usage: dict
+) -> tuple:
     """Parse and process a ``data:`` SSE line — track event types and filter thinking blocks.
 
     Parses JSON once, then performs both event-type tracking and thinking-index management.
@@ -453,10 +559,7 @@ async def proxy(request):
 
             # Capture original thinking type before _normalize_thinking mutates in-place
             thinking_cfg = data.get("thinking", {})
-            is_subagent = (
-                isinstance(thinking_cfg, dict)
-                and thinking_cfg.get("type") == "disabled"
-            )
+            is_subagent = isinstance(thinking_cfg, dict) and thinking_cfg.get("type") == "disabled"
 
             original_thinking_enabled = _thinking_requested(data)
 
@@ -481,6 +584,10 @@ async def proxy(request):
                     logger.info("[FLASH] routing to %s (model unchanged)", DEEPSEEK_FLASH)
                 thinking_normalized = True
 
+            if _inject_cache_control(data):
+                logger.info("[CACHE] injected cache_control markers")
+                thinking_normalized = True
+
             if thinking_normalized:
                 modified_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
                 headers["content-length"] = str(len(modified_body))
@@ -493,25 +600,64 @@ async def proxy(request):
 
     client = _get_client()
 
-    try:
-        req = client.build_request(
-            method=method,
-            url=upstream_url,
-            headers=headers,
-            content=modified_body,
-        )
-        upstream_resp = await client.send(req, stream=True)
-    except httpx.PoolTimeout:
-        logger.warning("upstream pool exhausted, returning 503")
+    # Retry loop with circuit breaker
+    last_exc = None
+    upstream_resp = None
+    for attempt in range(RETRY_MAX + 1):
+        if not _circuit_allow():
+            logger.warning("[CB] circuit open — rejecting request")
+            return JSONResponse(
+                {"error": {"message": "upstream temporarily unavailable", "type": "circuit_open"}},
+                status_code=503,
+                headers={"Retry-After": str(int(CB_TIMEOUT))},
+            )
+
+        try:
+            req = client.build_request(
+                method=method,
+                url=upstream_url,
+                headers=headers,
+                content=modified_body,
+            )
+            upstream_resp = await client.send(req, stream=True)
+            _circuit_success()
+            break
+        except _RETRYABLE_EXCEPTIONS as exc:
+            last_exc = exc
+            _circuit_failure()
+            if attempt < RETRY_MAX:
+                delay = RETRY_BACKOFF * (2**attempt) + _random.uniform(0, 0.5)
+                logger.warning(
+                    "[RETRY] attempt %d/%d, retrying in %.1fs: %s",
+                    attempt + 1,
+                    RETRY_MAX,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+        except httpx.PoolTimeout:
+            logger.warning("upstream pool exhausted, returning 503")
+            return JSONResponse(
+                {"error": {"message": "upstream busy, retry later", "type": "pool_exhausted"}},
+                status_code=503,
+                headers={"Retry-After": "10"},
+            )
+        except Exception:
+            _circuit_failure()
+            logger.exception("upstream request failed: %s %s", method, upstream_url)
+            return JSONResponse(
+                {"error": {"message": "upstream unavailable", "type": "proxy_error"}},
+                status_code=502,
+            )
+    else:
+        logger.error("[RETRY] all %d attempts exhausted: %s", RETRY_MAX, last_exc)
         return JSONResponse(
-            {"error": {"message": "upstream busy, retry later", "type": "pool_exhausted"}},
-            status_code=503,
-            headers={"Retry-After": "10"},
-        )
-    except Exception:
-        logger.exception("upstream request failed: %s %s", method, upstream_url)
-        return JSONResponse(
-            {"error": {"message": "upstream unavailable", "type": "proxy_error"}},
+            {
+                "error": {
+                    "message": "upstream unavailable after retries",
+                    "type": "upstream_timeout",
+                }
+            },
             status_code=502,
         )
 
@@ -609,13 +755,19 @@ async def proxy(request):
             logger.info("[RESP-FILTERED] lines=%d", len(all_filtered))
             if response_usage:
                 role = "subagent" if is_subagent else "primary"
+                cache_read = response_usage.get("cache_read_input_tokens", 0)
+                cache_create = response_usage.get("cache_creation_input_tokens", 0)
+                total_input = response_usage.get("input_tokens", 0)
+                cacheable = total_input + cache_read + cache_create
+                hit_pct = (cache_read * 100 // cacheable) if cacheable > 0 else 0
                 logger.info(
-                    "[COST] role=%s model=%s input=%s output=%s cache_read=%s",
+                    "[COST] role=%s model=%s input=%s output=%s cache_read=%s cache_hit=%s%%",
                     role,
                     model_name,
-                    response_usage.get("input_tokens", 0),
+                    total_input,
                     response_usage.get("output_tokens", 0),
-                    response_usage.get("cache_read_input_tokens", 0),
+                    cache_read,
+                    hit_pct,
                 )
             _dump_json(
                 "last_response_events.json",

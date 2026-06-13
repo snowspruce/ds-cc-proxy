@@ -7,6 +7,8 @@
 #   4. Sub-agent routing: redirect thinking=disabled requests to Flash endpoint for cost savings
 #   5. Cost tracking: log token usage per request with subagent/primary distinction
 #   6. Graceful shutdown: 5s drain window + shutdown signal to reject new requests
+#   7. Retry + circuit breaker: auto-retry on transient failures with exponential backoff
+#   8. Cache control: inject ephemeral cache_control breakpoints for prompt caching
 
 from ds_cc_proxy._version import VERSION
 from ds_cc_proxy.proxy import create_app
