@@ -1,9 +1,9 @@
-# dsv4-cc-proxy
+# ds-cc-proxy
 
 DeepSeek Anthropic API 兼容性代理 — 让 Claude Code 在 DeepSeek V4 模型上稳定运行。
 
 ```
-Claude Code ←→ localhost:16889 (dsv4-cc-proxy) ←→ api.deepseek.com/anthropic
+Claude Code ←→ localhost:16889 (ds-cc-proxy) ←→ api.deepseek.com/anthropic
 ```
 
 ## 与上游的区别
@@ -55,10 +55,10 @@ Claude Code ←→ localhost:16889 (dsv4-cc-proxy) ←→ api.deepseek.com/anthr
 pip install git+https://github.com/snowspruce/ds-cc-proxy.git
 
 # 启动代理
-dsv4-cc-proxy
+ds-cc-proxy
 
 # 停止代理
-dsv4-cc-proxy --stop
+ds-cc-proxy --stop
 ```
 
 ### 配置 Claude Code
@@ -94,10 +94,10 @@ curl http://localhost:16889/health
 
 ## 与本地代理的关系
 
-dsv4-cc-proxy 监听 `127.0.0.1:16889`，仅处理 Claude Code 通过 `ANTHROPIC_BASE_URL` 显式发来的请求，与 Clash Verge、V2Ray 等系统级代理互不冲突：
+ds-cc-proxy 监听 `127.0.0.1:16889`，仅处理 Claude Code 通过 `ANTHROPIC_BASE_URL` 显式发来的请求，与 Clash Verge、V2Ray 等系统级代理互不冲突：
 
 - **Clash Verge / V2Ray**：作为系统 HTTP/SOCKS5 代理（通常 `127.0.0.1:7890`），接管浏览器和大部分应用的出站流量
-- **dsv4-cc-proxy**：应用层代理，Claude Code 直连 `localhost:16889`，不经过系统代理
+- **ds-cc-proxy**：应用层代理，Claude Code 直连 `localhost:16889`，不经过系统代理
 
 两者工作在不同网络层，可同时运行，无需任何特殊配置。
 

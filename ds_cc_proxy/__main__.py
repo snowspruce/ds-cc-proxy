@@ -1,4 +1,4 @@
-# dsv4-cc-proxy CLI 入口
+# ds-cc-proxy CLI 入口
 
 
 import argparse
@@ -10,10 +10,10 @@ import time
 
 import uvicorn
 
-from dsv4_cc_proxy._version import VERSION
-from dsv4_cc_proxy.proxy import DUMP_DIR, HOST, LOG_LEVEL, PORT
+from ds_cc_proxy._version import VERSION
+from ds_cc_proxy.proxy import DUMP_DIR, HOST, LOG_LEVEL, PORT
 
-PIDFILE_DEFAULT = "/tmp/dsv4-cc-proxy.pid"
+PIDFILE_DEFAULT = "/tmp/ds-cc-proxy.pid"
 
 
 def _stop(pidfile: str):
@@ -25,7 +25,7 @@ def _stop(pidfile: str):
     with open(pidfile) as f:
         pid = int(f.read().strip())
 
-    print(f"Stopping dsv4-cc-proxy (PID {pid})...")
+    print(f"Stopping ds-cc-proxy (PID {pid})...")
 
     try:
         os.kill(pid, signal.SIGTERM)
@@ -103,7 +103,7 @@ def main():
         print(f"⚠ DUMP mode: {DUMP_DIR}")
     try:
         uvicorn.run(
-            "dsv4_cc_proxy.proxy:create_app",
+            "ds_cc_proxy.proxy:create_app",
             host=HOST,
             port=PORT,
             log_level=LOG_LEVEL,

@@ -1,4 +1,4 @@
-# dsv4-cc-proxy / proxy — 核心代理逻辑
+# ds-cc-proxy / proxy — 核心代理逻辑
 #
 # 环境变量:
 #   PROXY_UPSTREAM    DeepSeek API 地址 (默认 https://api.deepseek.com/anthropic)
@@ -27,7 +27,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from dsv4_cc_proxy._version import VERSION
+from ds_cc_proxy._version import VERSION
 
 # ---- 配置 ----
 

@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dsv4-cc-proxy"
+name = "ds-cc-proxy"
 version = "1.9.0"
 description = "DeepSeek Anthropic API 兼容性代理 — 让 Claude Code 在 DeepSeek V4 模型上稳定运行"
 authors = [{name = "HosheaLi"}]
@@ -36,7 +36,7 @@ Homepage = "https://github.com/snowspruce/ds-cc-proxy"
 Source = "https://github.com/snowspruce/ds-cc-proxy"
 
 [project.scripts]
-dsv4-cc-proxy = "dsv4_cc_proxy.__main__:main"
+ds-cc-proxy = "ds_cc_proxy.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
