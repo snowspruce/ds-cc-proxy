@@ -4,6 +4,7 @@
 import argparse
 import os
 import signal
+import stat
 import sys
 import time
 
@@ -73,20 +74,28 @@ def main():
         return
 
     pidfile = args.pidfile
+    pidfile_dir = os.path.dirname(pidfile) or "."
 
-    # 检查是否已有实例在运行
-    if os.path.exists(pidfile):
-        with open(pidfile) as f:
-            try:
+    # 确保 PID 文件目录存在
+    os.makedirs(pidfile_dir, exist_ok=True)
+
+    # S5+S6: 原子创建 PID 文件，消除 TOCTOU 竞态，限制权限为 owner-only
+    try:
+        pidfd = os.open(pidfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, stat.S_IRUSR | stat.S_IWUSR)
+    except FileExistsError:
+        # 文件已存在，检查进程是否存活
+        try:
+            with open(pidfile) as f:
                 pid = int(f.read().strip())
-                os.kill(pid, 0)
-                print(f"Proxy already running (PID {pid}), use --stop first")
-                sys.exit(1)
-            except (OSError, ValueError):
-                os.unlink(pidfile)
+            os.kill(pid, 0)
+            print(f"Proxy already running (PID {pid}), use --stop first")
+            sys.exit(1)
+        except (OSError, ValueError):
+            # 进程已死或 PID 文件损坏，清理后重试
+            os.unlink(pidfile)
+            pidfd = os.open(pidfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, stat.S_IRUSR | stat.S_IWUSR)
 
-    # 写入 PID 文件
-    with open(pidfile, "w") as f:
+    with os.fdopen(pidfd, "w") as f:
         f.write(str(os.getpid()))
 
     print(f"DeepSeek Thinking Proxy v{VERSION} → {HOST}:{PORT} (PID {os.getpid()})")

@@ -79,6 +79,14 @@ if PROXY_POOL_MAX_KEEPALIVE > PROXY_POOL_MAX_CONNECTIONS:
 PROXY_POOL_TIMEOUT = _parse_env_float("PROXY_POOL_TIMEOUT", 120.0, min_val=1.0)
 PROXY_UPSTREAM_TIMEOUT = _parse_env_float("PROXY_UPSTREAM_TIMEOUT", 600.0, min_val=1.0)
 PROXY_CONNECT_TIMEOUT = _parse_env_float("PROXY_CONNECT_TIMEOUT", 10.0, min_val=1.0)
+MAX_BODY_BYTES = _parse_env_int("PROXY_MAX_BODY_BYTES", 10 * 1024 * 1024, min_val=1024)
+
+# 需要从客户端请求头中剥离的危险头
+_REQUEST_STRIP_HEADERS = {
+    "host", "transfer-encoding", "connection", "upgrade",
+    "proxy-authorization", "proxy-connection", "proxy-authenticate",
+    "te", "trailer", "keep-alive",
+}
 
 # SSE 流处理参数上限
 MAX_EVENT_TYPES = 50
@@ -291,7 +299,12 @@ def _filter_sse_line(line: str, thinking_indices: set) -> tuple:
 
 if DUMP_DIR:
     os.makedirs(DUMP_DIR, exist_ok=True)
-    logger.warning("⚠ PROXY_DUMP_DIR enabled — data saved to %s", DUMP_DIR)
+    logger.warning(
+        "⚠ PROXY_DUMP_DIR enabled — data saved to %s. "
+        "Request/response bodies may contain API keys, tokens, and other secrets. "
+        "Use only for debugging and delete contents when done.",
+        DUMP_DIR,
+    )
 
 
 def _dump_json(filename: str, data):
@@ -348,15 +361,49 @@ def _build_response_headers(upstream_resp, is_sse: bool) -> dict:
 
 async def proxy(request):
     method = request.method
-    path = "/" + request.url.path.lstrip("/")
+    raw_path = request.url.path
+
+    # S1: 防止路径穿越
+    if ".." in raw_path:
+        logger.warning("[SEC] path traversal attempt: %s", raw_path)
+        return JSONResponse(
+            {"error": {"message": "bad request", "type": "invalid_path"}},
+            status_code=400,
+        )
+
+    path = "/" + raw_path.lstrip("/")
     upstream_url = f"{DEEPSEEK_BASE}{path}"
 
+    # S2: 剥离危险请求头
     headers = {k: v for k, v in request.headers.items()
-               if k.lower() not in ("host",)}
+               if k.lower() not in _REQUEST_STRIP_HEADERS}
 
     is_messages = (method == "POST" and path.rstrip("/").endswith("/messages"))
 
+    # S9: 限制请求体大小
+    if is_messages:
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_BODY_BYTES:
+                    logger.warning("[SEC] request body too large: %s bytes", content_length)
+                    return JSONResponse(
+                        {"error": {"message": "request body too large", "type": "payload_too_large"}},
+                        status_code=413,
+                    )
+            except (TypeError, ValueError):
+                pass
+
     body = await request.body() if is_messages else b""
+
+    # S9: 双重检查实际 body 大小
+    if is_messages and len(body) > MAX_BODY_BYTES:
+        logger.warning("[SEC] request body exceeds limit after read: %d bytes", len(body))
+        return JSONResponse(
+            {"error": {"message": "request body too large", "type": "payload_too_large"}},
+            status_code=413,
+        )
+
     modified_body = body
     strip_thinking = True
 
@@ -554,6 +601,6 @@ def create_app() -> Starlette:
         lifespan=lifespan,
         routes=[
             Route("/health", health, methods=["GET"]),
-            Route("/{path:path}", proxy, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
+            Route("/{path:path}", proxy, methods=["POST"]),
         ],
     )
