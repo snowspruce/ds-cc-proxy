@@ -94,7 +94,9 @@ ds-cc-proxy --stop
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `PROXY_UPSTREAM` | `https://api.deepseek.com/anthropic` | DeepSeek API 地址 |
+| `PROXY_UPSTREAM` | `https://api.deepseek.com/anthropic` | DeepSeek API 地址（主会话 / Pro 模型） |
+| `PROXY_FLASH_UPSTREAM` | 同 `PROXY_UPSTREAM` | 子代理路由的 Flash 上游地址 |
+| `PROXY_FLASH_MODEL` | *(空)* | 子代理替换模型名（如 `deepseek-v4-flash`，不设置则保持原模型名） |
 | `PROXY_HOST` | `127.0.0.1` | 监听地址 |
 | `PROXY_PORT` | `16889` | 监听端口 |
 | `PROXY_LOG_LEVEL` | `warning` | 日志级别 (`debug`/`info`/`warning`/`error`) |
@@ -105,6 +107,16 @@ ds-cc-proxy --stop
 | `PROXY_UPSTREAM_TIMEOUT` | `600.0` | 单次上游请求总超时（秒） |
 | `PROXY_CONNECT_TIMEOUT` | `10.0` | 上游 TCP 连接超时（秒） |
 | `PROXY_DUMP_DIR` | *(空)* | 流量捕获目录（含敏感数据，仅调试用） |
+
+### 子代理自动降级
+
+Claude Code 子代理（`thinking: disabled`）的请求自动路由到 Flash 上游，主会话（`thinking: enabled` / `adaptive`）保持 Pro 路由。子代理使用 `budget_tokens=2048` 控制 thinking 成本——比 Pro 默认预算低 50%+，但足够保证生成质量。
+
+```bash
+# 可选：指定 Flash 上游和模型名
+export PROXY_FLASH_UPSTREAM="https://api.deepseek.com/anthropic"
+export PROXY_FLASH_MODEL="deepseek-v4-flash"
+```
 
 ## 健康检查
 

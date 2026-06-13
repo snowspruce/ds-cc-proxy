@@ -252,6 +252,7 @@ class TestNormalizeThinking:
         }
         assert _normalize_thinking(data) is True
         assert data["thinking"]["type"] == "enabled"
+        assert data["thinking"]["budget_tokens"] == 2048
         assert "reasoning_effort" not in data
         assert "output_config" not in data
         # thinking block stripped from messages
@@ -263,6 +264,7 @@ class TestNormalizeThinking:
         data = {"thinking": {"type": "disabled"}}
         assert _normalize_thinking(data) is True
         assert data["thinking"]["type"] == "enabled"
+        assert data["thinking"]["budget_tokens"] == 2048
 
     def test_unknown_type_noop(self):
         data = {"thinking": {"type": "unknown_mode"}}
@@ -280,6 +282,24 @@ class TestNormalizeThinking:
             ],
         }
         assert _normalize_thinking(data) is True
+
+    def test_disabled_budget_matches_subagent_expectation(self):
+        """子代理 disabled→enabled 的 budget_tokens=2048 是设计值，勿随意改。"""
+        data = {
+            "thinking": {"type": "disabled"},
+            "messages": [],
+        }
+        _normalize_thinking(data)
+        assert data["thinking"]["budget_tokens"] == 2048
+
+    def test_enabled_preserves_original_budget(self):
+        """主会话 enabled + budget_tokens 应完整保留，不被篡改。"""
+        data = {
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "messages": [],
+        }
+        assert _normalize_thinking(data) is False
+        assert data["thinking"]["budget_tokens"] == 4096
 
 
 # ---------------------------------------------------------------------------

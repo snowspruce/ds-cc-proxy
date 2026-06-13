@@ -32,6 +32,8 @@ from ds_cc_proxy._version import VERSION
 # ---- 配置 ----
 
 DEEPSEEK_BASE = os.getenv("PROXY_UPSTREAM", "https://api.deepseek.com/anthropic")
+DEEPSEEK_FLASH = os.getenv("PROXY_FLASH_UPSTREAM", DEEPSEEK_BASE)
+FLASH_MODEL = os.getenv("PROXY_FLASH_MODEL", "")  # 子代理替换模型名，如 deepseek-v4-flash
 HOST = os.getenv("PROXY_HOST", "127.0.0.1")
 try:
     PORT = int(os.getenv("PROXY_PORT", "16889"))
@@ -223,9 +225,9 @@ def _normalize_thinking(data: dict) -> bool:
         return False
 
     # disabled → 子代理硬编码值，DeepSeek v4 在某些请求下拒绝
-    # 转为 enabled 并移除 reasoning_effort/output_config
+    # 转为 enabled + 最小预算（子代理不需要深度思考，但给足够推理空间保证质量）
     if thinking_type == "disabled":
-        data["thinking"] = {"type": "enabled"}
+        data["thinking"] = {"type": "enabled", "budget_tokens": 2048}
 
         for key in ("reasoning_effort", "output_config"):
             val = data.pop(key, None)
@@ -428,6 +430,13 @@ async def proxy(request):
             logger.info("[REQ] %s", json.dumps(_summarize_request(data), ensure_ascii=False))
             _dump_json("last_request.json", data)
 
+            # 捕获原始 thinking 类型（_normalize_thinking 会原地修改）
+            thinking_cfg = data.get("thinking", {})
+            is_subagent = (
+                isinstance(thinking_cfg, dict)
+                and thinking_cfg.get("type") == "disabled"
+            )
+
             original_thinking_enabled = _thinking_requested(data)
 
             thinking_normalized = _normalize_thinking(data)
@@ -440,6 +449,16 @@ async def proxy(request):
                 strip_thinking = False
             else:
                 logger.info("[STRIP] response filter enabled")
+
+            if is_subagent:
+                # 子代理路由到 Flash 上游 + 替换模型名
+                upstream_url = f"{DEEPSEEK_FLASH}{path}"
+                if FLASH_MODEL:
+                    data["model"] = FLASH_MODEL
+                    logger.info("[FLASH] routing to %s model=%s", DEEPSEEK_FLASH, FLASH_MODEL)
+                else:
+                    logger.info("[FLASH] routing to %s (model unchanged)", DEEPSEEK_FLASH)
+                thinking_normalized = True
 
             if thinking_normalized:
                 modified_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
