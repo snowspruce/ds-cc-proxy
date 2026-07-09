@@ -25,6 +25,7 @@ import os
 import random as _random
 import sys
 import time as _time
+from collections import deque
 from contextlib import asynccontextmanager
 
 import httpx
@@ -89,8 +90,12 @@ PROXY_CONNECT_TIMEOUT = _parse_env_float("PROXY_CONNECT_TIMEOUT", 10.0, min_val=
 MAX_BODY_BYTES = _parse_env_int("PROXY_MAX_BODY_BYTES", 10 * 1024 * 1024, min_val=1024)
 RETRY_MAX = _parse_env_int("PROXY_RETRY_MAX", 3, min_val=0)
 RETRY_BACKOFF = _parse_env_float("PROXY_RETRY_BACKOFF", 1.0, min_val=0.1)
-CB_THRESHOLD = _parse_env_int("PROXY_CIRCUIT_BREAKER_THRESHOLD", 5, min_val=1)
-CB_TIMEOUT = _parse_env_float("PROXY_CIRCUIT_BREAKER_TIMEOUT", 30.0, min_val=5.0)
+CB_THRESHOLD = _parse_env_int("PROXY_CB_THRESHOLD", 8, min_val=1)
+CB_WINDOW = _parse_env_float("PROXY_CB_WINDOW", 60.0, min_val=10.0)
+CB_TIMEOUT_BASE = _parse_env_float("PROXY_CB_TIMEOUT_BASE", 30.0, min_val=5.0)
+CB_TIMEOUT_MAX = _parse_env_float("PROXY_CB_TIMEOUT_MAX", 300.0, min_val=30.0)
+CB_BACKOFF_RESET = _parse_env_float("PROXY_CB_BACKOFF_RESET", 600.0, min_val=60.0)
+CB_HEALTH_INTERVAL = _parse_env_float("PROXY_CB_HEALTH_INTERVAL", 15.0, min_val=5.0)
 
 # Dangerous hop-by-hop headers to strip from inbound requests
 _REQUEST_STRIP_HEADERS = {
@@ -170,14 +175,14 @@ async def usage_endpoint(request):
     cacheable = inp + cache
     hit_pct = (cache * 100 // cacheable) if cacheable > 0 else 0
 
-    # DeepSeek V4 official pricing (per MTok, RMB):
-    #   V4-Pro:  input ¥3, output ¥6  (cache miss)
-    #   V4-Flash: input ¥1, output ¥2  (cache miss)
+    # DeepSeek V4 official pricing (per MTok, USD @ ~7.2 CNY/USD):
+    #   V4-Pro:  input ¥3 ≈ $0.42, output ¥6 ≈ $0.83 (cache miss)
+    #   V4-Flash: input ¥1 ≈ $0.14, output ¥2 ≈ $0.28 (cache miss)
     # Source: https://platform.deepseek.com/api-docs/pricing
-    price_pro_in = 3.0
-    price_pro_out = 6.0
-    price_flash_in = 1.0
-    price_flash_out = 2.0
+    price_pro_in = 0.42
+    price_pro_out = 0.83
+    price_flash_in = 0.14
+    price_flash_out = 0.28
 
     p = _usage_primary
     s = _usage_subagent
@@ -220,11 +225,15 @@ async def usage_endpoint(request):
     )
 
 
-# ---- Circuit breaker ----
+# ---- Circuit breaker (sliding-window + progressive backoff + error grading) ----
 
 _circuit_state = "closed"  # closed | open | half_open
-_circuit_failures = 0
+_circuit_failure_times: deque[float] = deque()  # sliding window timestamps
+_circuit_failure_weight = 0.0  # accumulated severity in current window
 _circuit_opened_at = 0.0
+_circuit_backoff_level = 0  # 0=base, 1=2x, 2=4x, ...
+_circuit_last_close_at = 0.0  # when circuit last returned to closed
+_circuit_health_task: asyncio.Task | None = None  # background health checker
 
 _RETRYABLE_EXCEPTIONS = (
     httpx.TimeoutException,
@@ -232,16 +241,55 @@ _RETRYABLE_EXCEPTIONS = (
     httpx.RemoteProtocolError,
 )
 
+# Error severity: ConnectError/Timeout → network-level (full weight),
+# RemoteProtocolError → server hiccup (half weight)
+_ERROR_SEVERITY: dict[type, float] = {
+    httpx.ConnectError: 1.0,
+    httpx.TimeoutException: 1.0,
+    httpx.RemoteProtocolError: 0.5,
+}
+
+
+def _circuit_prune_window(now: float) -> None:
+    """Remove failure entries older than CB_WINDOW seconds and update weight."""
+    cutoff = now - CB_WINDOW
+    removed = 0
+    removed_weight = 0.0
+    while _circuit_failure_times:
+        ts, weight = _circuit_failure_times[0]
+        if ts < cutoff:
+            _circuit_failure_times.popleft()
+            removed += 1
+            removed_weight += weight
+        else:
+            break
+    if removed:
+        _circuit_failure_weight = max(0.0, _circuit_failure_weight - removed_weight)
+
+
+def _circuit_backoff_timeout() -> float:
+    """Progressive backoff: base, 2x base, 4x base, ... up to max."""
+    delay = CB_TIMEOUT_BASE * (2**_circuit_backoff_level)
+    return min(delay, CB_TIMEOUT_MAX)
+
 
 def _circuit_allow() -> bool:
     """Return True if the circuit allows a request through."""
-    global _circuit_state, _circuit_failures, _circuit_opened_at
+    global _circuit_state, _circuit_opened_at
+    now = _time.monotonic()
+    _circuit_prune_window(now)
+
     if _circuit_state == "closed":
         return True
     if _circuit_state == "open":
-        if _time.monotonic() - _circuit_opened_at >= CB_TIMEOUT:
+        timeout = _circuit_backoff_timeout()
+        if now - _circuit_opened_at >= timeout:
             _circuit_state = "half_open"
-            logger.warning("[CB] circuit half-open — allowing trial request")
+            logger.warning(
+                "[CB] circuit half-open — allowing trial request (backoff level=%d, timeout=%.0fs)",
+                _circuit_backoff_level,
+                timeout,
+            )
             return True
         return False
     # half_open — allow one trial
@@ -249,28 +297,88 @@ def _circuit_allow() -> bool:
 
 
 def _circuit_success():
-    global _circuit_state, _circuit_failures
+    global _circuit_state, _circuit_failure_times, _circuit_failure_weight
+    global _circuit_backoff_level, _circuit_last_close_at
+    now = _time.monotonic()
+    _circuit_prune_window(now)
     if _circuit_state == "half_open":
         _circuit_state = "closed"
-        _circuit_failures = 0
-        logger.info("[CB] circuit closed — upstream recovered")
+        _circuit_failure_times.clear()
+        _circuit_failure_weight = 0.0
+        _circuit_last_close_at = now
+        logger.info("[CB] circuit closed — upstream recovered (level=%d)", _circuit_backoff_level)
+        # Reset backoff level after a grace period
     elif _circuit_state == "closed":
-        _circuit_failures = 0
+        _circuit_failure_times.clear()
+        _circuit_failure_weight = 0.0
+        _circuit_last_close_at = now
 
 
-def _circuit_failure():
-    global _circuit_state, _circuit_failures, _circuit_opened_at
-    _circuit_failures += 1
+def _circuit_failure(exc: Exception):
+    global _circuit_state, _circuit_opened_at, _circuit_backoff_level
+    now = _time.monotonic()
+    _circuit_prune_window(now)
+
+    # Reset backoff if enough time has passed since last close
+    if _circuit_last_close_at > 0 and (now - _circuit_last_close_at) > CB_BACKOFF_RESET:
+        _circuit_backoff_level = 0
+
+    # Grade severity by exception type
+    severity = _ERROR_SEVERITY.get(type(exc), 1.0)
+    _circuit_failure_times.append((now, severity))
+    _circuit_failure_weight += severity
+
+    weighted_count = _circuit_failure_weight
+
     if _circuit_state == "half_open" or (
-        _circuit_state == "closed" and _circuit_failures >= CB_THRESHOLD
+        _circuit_state == "closed" and weighted_count >= CB_THRESHOLD
     ):
         _circuit_state = "open"
-        _circuit_opened_at = _time.monotonic()
+        _circuit_opened_at = now
+        _circuit_backoff_level = min(_circuit_backoff_level + 1, 10)
+        timeout = _circuit_backoff_timeout()
         logger.warning(
-            "[CB] circuit open — %d consecutive failures, blocking for %.0fs",
-            _circuit_failures,
-            CB_TIMEOUT,
+            "[CB] circuit open — weighted=%.1f/%d failures, blocking for %.0fs (level=%d)",
+            weighted_count,
+            CB_THRESHOLD,
+            timeout,
+            _circuit_backoff_level,
         )
+
+
+async def _circuit_health_check():
+    """Background task: probe upstream when circuit is open to auto-recover."""
+    logger.info("[CB-HEALTH] health checker started")
+    client = _get_client()
+    while not _shutting_down:
+        if _circuit_state == "open":
+            try:
+                resp = await client.get(f"{DEEPSEEK_BASE}/../", timeout=httpx.Timeout(5.0, connect=5.0))
+                if resp.status_code < 500:
+                    logger.info("[CB-HEALTH] upstream health check OK, resetting circuit")
+                    _circuit_state = "closed"
+                    _circuit_failure_times.clear()
+                    _circuit_failure_weight = 0.0
+                    _circuit_backoff_level = 0
+                    _circuit_last_close_at = _time.monotonic()
+                else:
+                    logger.debug("[CB-HEALTH] upstream returned %d", resp.status_code)
+            except Exception:
+                logger.debug("[CB-HEALTH] upstream not reachable")
+        await asyncio.sleep(CB_HEALTH_INTERVAL)
+    logger.info("[CB-HEALTH] health checker stopped")
+
+
+def _start_health_check():
+    global _circuit_health_task
+    if _circuit_health_task is None or _circuit_health_task.done():
+        _circuit_health_task = asyncio.create_task(_circuit_health_check())
+
+
+def _stop_health_check():
+    global _circuit_health_task
+    if _circuit_health_task and not _circuit_health_task.done():
+        _circuit_health_task.cancel()
 
 
 # ---- httpx client ----
@@ -302,8 +410,23 @@ async def health(request):
             "status": "ok",
             "version": VERSION,
             "upstream": DEEPSEEK_BASE,
+            "circuit": _circuit_state,
         }
     )
+
+
+async def admin_reset_circuit(request):
+    """Manual circuit breaker reset (127.0.0.1 only, no external exposure)."""
+    global _circuit_state, _circuit_failure_times, _circuit_failure_weight
+    global _circuit_backoff_level, _circuit_last_close_at
+    prev = _circuit_state
+    _circuit_state = "closed"
+    _circuit_failure_times.clear()
+    _circuit_failure_weight = 0.0
+    _circuit_backoff_level = 0
+    _circuit_last_close_at = _time.monotonic()
+    logger.info("[CB] manual reset — %s → closed", prev)
+    return JSONResponse({"circuit": "reset", "state": "closed", "previous": prev})
 
 
 # ---- Fix 1: request-side thinking injection ----
@@ -641,7 +764,7 @@ async def proxy(request):
             return JSONResponse(
                 {"error": {"message": "upstream temporarily unavailable", "type": "circuit_open"}},
                 status_code=503,
-                headers={"Retry-After": str(int(CB_TIMEOUT))},
+                headers={"Retry-After": str(int(_circuit_backoff_timeout()))},
             )
 
         try:
@@ -656,7 +779,7 @@ async def proxy(request):
             break
         except _RETRYABLE_EXCEPTIONS as exc:
             last_exc = exc
-            _circuit_failure()
+            _circuit_failure(exc)
             if attempt < RETRY_MAX:
                 delay = RETRY_BACKOFF * (2**attempt) + _random.uniform(0, 0.5)
                 logger.warning(
@@ -674,8 +797,8 @@ async def proxy(request):
                 status_code=503,
                 headers={"Retry-After": "10"},
             )
-        except Exception:
-            _circuit_failure()
+        except Exception as exc:
+            _circuit_failure(exc)
             logger.exception("upstream request failed: %s %s", method, upstream_url)
             return JSONResponse(
                 {"error": {"message": "upstream unavailable", "type": "proxy_error"}},
@@ -832,9 +955,11 @@ _shutting_down = False
 async def lifespan(app):
     global _shutting_down
     logger.info("started v%s (upstream=%s)", VERSION, DEEPSEEK_BASE)
+    _start_health_check()
     yield
     logger.info("shutting down — draining active connections")
     _shutting_down = True
+    _stop_health_check()
     # Allow a grace period for in-flight requests to complete
     try:
         await asyncio.sleep(5)
@@ -851,6 +976,7 @@ def create_app() -> Starlette:
         routes=[
             Route("/health", health, methods=["GET"]),
             Route("/usage", usage_endpoint, methods=["GET"]),
+            Route("/admin/circuit/reset", admin_reset_circuit, methods=["POST"]),
             Route(
                 "/{path:path}",
                 proxy,
