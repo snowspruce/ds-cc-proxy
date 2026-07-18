@@ -110,6 +110,7 @@ _REQUEST_STRIP_HEADERS = {
     "te",
     "trailer",
     "keep-alive",
+    "content-length",
 }
 
 # SSE stream processing limits
