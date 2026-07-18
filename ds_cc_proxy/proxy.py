@@ -96,6 +96,7 @@ CB_TIMEOUT_BASE = _parse_env_float("PROXY_CB_TIMEOUT_BASE", 30.0, min_val=5.0)
 CB_TIMEOUT_MAX = _parse_env_float("PROXY_CB_TIMEOUT_MAX", 300.0, min_val=30.0)
 CB_BACKOFF_RESET = _parse_env_float("PROXY_CB_BACKOFF_RESET", 600.0, min_val=60.0)
 CB_HEALTH_INTERVAL = _parse_env_float("PROXY_CB_HEALTH_INTERVAL", 15.0, min_val=5.0)
+CLIENT_MAX_AGE = _parse_env_float("PROXY_CLIENT_MAX_AGE", 300.0, min_val=30.0)
 
 # Dangerous hop-by-hop headers to strip from inbound requests
 _REQUEST_STRIP_HEADERS = {
@@ -252,6 +253,7 @@ _ERROR_SEVERITY: dict[type, float] = {
 
 def _circuit_prune_window(now: float) -> None:
     """Remove failure entries older than CB_WINDOW seconds and update weight."""
+    global _circuit_failure_weight
     cutoff = now - CB_WINDOW
     removed = 0
     removed_weight = 0.0
@@ -315,7 +317,8 @@ def _circuit_success():
 
 
 def _circuit_failure(exc: Exception):
-    global _circuit_state, _circuit_opened_at, _circuit_backoff_level
+    global _circuit_state, _circuit_opened_at, _circuit_backoff_level, _circuit_failure_weight
+    global _shared_client, _client_created_at
     now = _time.monotonic()
     _circuit_prune_window(now)
 
@@ -344,10 +347,17 @@ def _circuit_failure(exc: Exception):
             timeout,
             _circuit_backoff_level,
         )
+        # Dispose stale connection pool — circuit trip indicates upstream issues
+        if _shared_client and not _shared_client.is_closed:
+            logger.warning("[CLIENT] circuit open, discarding connection pool")
+        _shared_client = None
+        _client_created_at = 0.0
 
 
 async def _circuit_health_check():
     """Background task: probe upstream when circuit is open to auto-recover."""
+    global _circuit_state, _circuit_failure_times, _circuit_failure_weight
+    global _circuit_backoff_level, _circuit_last_close_at
     logger.info("[CB-HEALTH] health checker started")
     client = _get_client()
     while not _shutting_down:
@@ -383,9 +393,16 @@ def _stop_health_check():
 
 # ---- httpx client ----
 
+_client_created_at = 0.0
+
 
 def _get_client() -> httpx.AsyncClient:
-    global _shared_client
+    global _shared_client, _client_created_at
+    now = _time.monotonic()
+    if _shared_client is not None and not _shared_client.is_closed:
+        if _client_created_at > 0 and (now - _client_created_at) > CLIENT_MAX_AGE:
+            logger.info("[CLIENT] max age reached (%.0fs), forcing recreate", now - _client_created_at)
+            _shared_client = None
     if _shared_client is None or _shared_client.is_closed:
         _shared_client = httpx.AsyncClient(
             timeout=httpx.Timeout(
@@ -398,6 +415,8 @@ def _get_client() -> httpx.AsyncClient:
                 max_connections=PROXY_POOL_MAX_CONNECTIONS,
             ),
         )
+        _client_created_at = now
+        logger.info("[CLIENT] created new httpx client")
     return _shared_client
 
 
