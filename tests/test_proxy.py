@@ -6,13 +6,17 @@
 #   - SSE 行过滤
 #   - 请求摘要 & 响应头构建
 
+import socket
 from unittest.mock import MagicMock
+
+import httpx
 
 from ds_cc_proxy.proxy import (
     _build_response_headers,
     _has_thinking,
     _has_tool_use,
     _inject_thinking_blocks,
+    _is_dns_resolution_error,
     _normalize_thinking,
     _parse_env_float,
     _parse_env_int,
@@ -542,3 +546,69 @@ class TestSummarizeRequest:
         assert len(summary["tool_names"]) == 10
 
 
+# ---------------------------------------------------------------------------
+# _is_dns_resolution_error / DNS 熔断分级
+# ---------------------------------------------------------------------------
+
+
+def _make_gaierror():
+    return socket.gaierror(8, "nodename nor servname provided, or not known")
+
+
+class TestIsDnsResolutionError:
+    def test_raw_gaierror(self):
+        assert _is_dns_resolution_error(_make_gaierror()) is True
+
+    def test_httpx_wrapped_gaierror(self):
+        gai = _make_gaierror()
+        wrapped = httpx.ConnectError(str(gai))
+        wrapped.__cause__ = gai  # 模拟 httpx `raise ... from exc`
+        assert _is_dns_resolution_error(wrapped) is True
+
+    def test_deep_chain_httpcore_gaierror(self):
+        # 真实链路: httpx.ConnectError -> httpcore.ConnectError -> socket.gaierror
+        gai = _make_gaierror()
+        httpcore_err = Exception(str(gai))
+        httpcore_err.__cause__ = gai
+        httpx_err = httpx.ConnectError(str(httpcore_err))
+        httpx_err.__cause__ = httpcore_err
+        assert _is_dns_resolution_error(httpx_err) is True
+
+    def test_connect_error_without_dns(self):
+        assert _is_dns_resolution_error(httpx.ConnectError("Connection refused")) is False
+
+    def test_timeout_not_dns(self):
+        assert _is_dns_resolution_error(httpx.TimeoutException("timed out")) is False
+
+    def test_remote_protocol_error_not_dns(self):
+        assert _is_dns_resolution_error(httpx.RemoteProtocolError("server disconnected")) is False
+
+
+class TestCircuitFailureDnsGrading:
+    def test_dns_failure_does_not_count_toward_circuit(self):
+        import ds_cc_proxy.proxy as proxy
+
+        proxy._circuit_failure_times.clear()
+        proxy._circuit_failure_weight = 0.0
+        proxy._circuit_state = "closed"
+        proxy._circuit_backoff_level = 0
+
+        for _ in range(proxy.CB_THRESHOLD * 3):
+            proxy._circuit_failure(_make_gaierror())
+
+        assert proxy._circuit_failure_weight == 0.0
+        assert proxy._circuit_state == "closed"
+        assert not proxy._circuit_failure_times
+
+    def test_non_dns_failure_still_counts(self):
+        import ds_cc_proxy.proxy as proxy
+
+        proxy._circuit_failure_times.clear()
+        proxy._circuit_failure_weight = 0.0
+        proxy._circuit_state = "closed"
+        proxy._circuit_backoff_level = 0
+
+        proxy._circuit_failure(httpx.ConnectError("Connection refused"))
+
+        assert proxy._circuit_failure_weight == 1.0
+        assert len(proxy._circuit_failure_times) == 1

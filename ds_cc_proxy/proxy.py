@@ -23,6 +23,7 @@ import logging
 import logging.handlers
 import os
 import random as _random
+import socket
 import sys
 import time as _time
 from collections import deque
@@ -252,6 +253,23 @@ _ERROR_SEVERITY: dict[type, float] = {
 }
 
 
+def _is_dns_resolution_error(exc: Exception) -> bool:
+    """True if the exception chain contains a DNS resolution failure (socket.gaierror).
+
+    httpx wraps socket errors as httpx.ConnectError, chaining the original error via
+    ``__cause__`` (httpx.ConnectError → httpcore.ConnectError → socket.gaierror). DNS
+    failures are environmental (e.g. VPN fake-ip resolver blips), not upstream overload.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, socket.gaierror):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _circuit_prune_window(now: float) -> None:
     """Remove failure entries older than CB_WINDOW seconds and update weight."""
     global _circuit_failure_weight
@@ -323,6 +341,13 @@ def _circuit_failure(exc: Exception):
     now = _time.monotonic()
     _circuit_prune_window(now)
 
+    # DNS resolution failures are environmental (e.g. VPN fake-ip resolver blips),
+    # not upstream overload. Don't count them toward the circuit — the retry loop
+    # already handles transient lookups, and tripping on DNS would 503 everything.
+    if _is_dns_resolution_error(exc):
+        logger.warning("[CB] DNS resolution failure, not counting toward circuit: %s", exc)
+        return
+
     # Reset backoff if enough time has passed since last close
     if _circuit_last_close_at > 0 and (now - _circuit_last_close_at) > CB_BACKOFF_RESET:
         _circuit_backoff_level = 0
@@ -360,13 +385,17 @@ async def _circuit_health_check():
     global _circuit_state, _circuit_failure_times, _circuit_failure_weight
     global _circuit_backoff_level, _circuit_last_close_at
     logger.info("[CB-HEALTH] health checker started")
-    client = _get_client()
+    probe_url = f"{DEEPSEEK_BASE}/v1/models"
     while not _shutting_down:
         if _circuit_state == "open":
             try:
-                resp = await client.get(f"{DEEPSEEK_BASE}/../", timeout=httpx.Timeout(5.0, connect=5.0))
+                client = _get_client()
+                resp = await client.get(probe_url, timeout=httpx.Timeout(5.0, connect=5.0))
                 if resp.status_code < 500:
-                    logger.info("[CB-HEALTH] upstream health check OK, resetting circuit")
+                    logger.info(
+                        "[CB-HEALTH] upstream probe OK (status=%d), resetting circuit",
+                        resp.status_code,
+                    )
                     _circuit_state = "closed"
                     _circuit_failure_times.clear()
                     _circuit_failure_weight = 0.0
