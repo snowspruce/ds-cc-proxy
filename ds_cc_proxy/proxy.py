@@ -170,6 +170,33 @@ def _track_usage(role: str, usage: dict):
     bucket["output_tokens"] += out
 
 
+def _log_and_track_usage(role: str, model: str, response_usage: dict):
+    """Log a [COST] line and accumulate counters — shared by every response path.
+
+    Previously only the strip-filtered SSE path tracked usage, so the bulk of
+    traffic (thinking-enabled streaming + non-streaming) was invisible to
+    /usage and to the cache-hit detection. Call this from every response path.
+    """
+    if not response_usage:
+        logger.info("[COST] role=%s model=%s — no usage fields in response", role, model)
+        return
+    cache_read = response_usage.get("cache_read_input_tokens", 0)
+    cache_create = response_usage.get("cache_creation_input_tokens", 0)
+    total_input = response_usage.get("input_tokens", 0)
+    cacheable = total_input + cache_read + cache_create
+    hit_pct = (cache_read * 100 // cacheable) if cacheable > 0 else 0
+    logger.info(
+        "[COST] role=%s model=%s input=%s output=%s cache_read=%s cache_hit=%s%%",
+        role,
+        model,
+        total_input,
+        response_usage.get("output_tokens", 0),
+        cache_read,
+        hit_pct,
+    )
+    _track_usage(role, response_usage)
+
+
 async def usage_endpoint(request):
     n = _usage["requests"]
     inp = _usage["input_tokens"]
@@ -581,6 +608,28 @@ def _normalize_thinking(data: dict) -> bool:
 # ---- Fix 3: response-side thinking stripping ----
 
 
+def _extract_usage(data: dict, response_usage: dict) -> None:
+    """Copy usage fields from a parsed SSE/JSON event into response_usage."""
+    if data.get("type") not in ("message_stop", "message_delta"):
+        return
+    u = data.get("usage")
+    if isinstance(u, dict):
+        response_usage.update(u)
+
+
+def _scan_sse_usage(line: str, response_usage: dict) -> None:
+    """Extract usage from a raw SSE ``data:`` line (passthrough paths)."""
+    if not line.startswith("data: "):
+        return
+    try:
+        data = json.loads(line[6:])
+    except json.JSONDecodeError:
+        return
+    if not isinstance(data, dict):
+        return
+    _extract_usage(data, response_usage)
+
+
 def _thinking_requested(data: dict) -> bool:
     thinking_cfg = data.get("thinking", {})
     return isinstance(thinking_cfg, dict) and thinking_cfg.get("type") in ("enabled", "adaptive")
@@ -610,10 +659,7 @@ def _process_sse_data_line(
     # Event type tracking
     if len(event_types) < MAX_EVENT_TYPES:
         event_types.append(t if t else "?")
-    if t in ("message_stop", "message_delta"):
-        u = data.get("usage")
-        if isinstance(u, dict):
-            response_usage.update(u)
+    _extract_usage(data, response_usage)
 
     # Thinking block filtering
     if t == "content_block_start":
@@ -758,9 +804,10 @@ async def proxy(request):
     modified_body = body
     strip_thinking = True
 
+    is_subagent = False
+    model_name = "?"
+
     if is_messages:
-        is_subagent = False
-        model_name = "?"
         try:
             data = json.loads(body)
             model_name = data.get("model", "?")
@@ -803,6 +850,8 @@ async def proxy(request):
             logger.warning("[REQ] invalid JSON body, forwarding as-is")
         except (KeyError, TypeError):
             logger.exception("[REQ] unexpected body structure, forwarding as-is")
+
+    role = "subagent" if is_subagent else "primary"
 
     client = _get_client()
 
@@ -894,14 +943,56 @@ async def proxy(request):
         )
 
     if not strip_thinking or not is_sse:
+        if is_sse:
+            # Streaming + thinking enabled (primary adaptive traffic): forward
+            # untouched, but scan the SSE stream for usage so /usage and the
+            # cache-hit detection see this traffic too.
+            async def passthrough():
+                buffer = ""
+                response_usage = {}
+                try:
+                    async for chunk in upstream_resp.aiter_bytes():
+                        yield chunk
+                        buffer += chunk.decode("utf-8", errors="replace")
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            _scan_sse_usage(line.rstrip("\r"), response_usage)
+                except Exception:
+                    logger.exception("upstream stream read error")
+                finally:
+                    _log_and_track_usage(role, model_name, response_usage)
+                    try:
+                        await upstream_resp.aclose()
+                    except Exception:
+                        logger.debug("upstream_resp aclose error (may already be closed)")
 
+            return StreamingResponse(
+                passthrough(),
+                status_code=upstream_resp.status_code,
+                headers=_build_response_headers(upstream_resp, True),
+            )
+
+        # Non-streaming (JSON) response: buffer body and read usage from the JSON.
         async def passthrough():
+            body = b""
+            response_usage = {}
             try:
                 async for chunk in upstream_resp.aiter_bytes():
-                    yield chunk
+                    body += chunk
+                if body:
+                    try:
+                        payload = json.loads(body)
+                    except json.JSONDecodeError:
+                        payload = None
+                    if isinstance(payload, dict):
+                        u = payload.get("usage")
+                        if isinstance(u, dict):
+                            response_usage.update(u)
+                yield body
             except Exception:
                 logger.exception("upstream stream read error")
             finally:
+                _log_and_track_usage(role, model_name, response_usage)
                 try:
                     await upstream_resp.aclose()
                 except Exception:
@@ -910,7 +1001,7 @@ async def proxy(request):
         return StreamingResponse(
             passthrough(),
             status_code=upstream_resp.status_code,
-            headers=_build_response_headers(upstream_resp, is_sse),
+            headers=_build_response_headers(upstream_resp, False),
         )
 
     logger.info("[FILTER] stripping thinking from SSE stream")
@@ -959,23 +1050,7 @@ async def proxy(request):
         finally:
             logger.info("[RESP-EVENTS] raw=%s", event_types[:LOG_EVENT_PREVIEW])
             logger.info("[RESP-FILTERED] lines=%d", len(all_filtered))
-            if response_usage:
-                role = "subagent" if is_subagent else "primary"
-                cache_read = response_usage.get("cache_read_input_tokens", 0)
-                cache_create = response_usage.get("cache_creation_input_tokens", 0)
-                total_input = response_usage.get("input_tokens", 0)
-                cacheable = total_input + cache_read + cache_create
-                hit_pct = (cache_read * 100 // cacheable) if cacheable > 0 else 0
-                logger.info(
-                    "[COST] role=%s model=%s input=%s output=%s cache_read=%s cache_hit=%s%%",
-                    role,
-                    model_name,
-                    total_input,
-                    response_usage.get("output_tokens", 0),
-                    cache_read,
-                    hit_pct,
-                )
-                _track_usage(role, response_usage)
+            _log_and_track_usage(role, model_name, response_usage)
             _dump_json(
                 "last_response_events.json",
                 {

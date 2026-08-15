@@ -12,16 +12,20 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+import ds_cc_proxy.proxy as proxy_module
 from ds_cc_proxy.proxy import (
     _build_response_headers,
     _dns_error_severity,
+    _extract_usage,
     _has_thinking,
     _has_tool_use,
     _inject_thinking_blocks,
+    _log_and_track_usage,
     _normalize_thinking,
     _parse_env_float,
     _parse_env_int,
     _process_sse_data_line,
+    _scan_sse_usage,
     _summarize_request,
     _thinking_requested,
 )
@@ -643,3 +647,146 @@ class TestCircuitFailureDnsGrading:
 
         assert proxy._circuit_failure_weight == 1.0
         assert len(proxy._circuit_failure_times) == 1
+
+
+# ---------------------------------------------------------------------------
+# _scan_sse_usage / _extract_usage (passthrough 路径的 usage 采集)
+# ---------------------------------------------------------------------------
+
+
+class TestScanSseUsage:
+    def test_extracts_message_delta_usage(self):
+        usage = {}
+        line = (
+            'data: {"type":"message_delta","usage":'
+            '{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":100}}'
+        )
+        _scan_sse_usage(line, usage)
+        assert usage == {
+            "input_tokens": 120,
+            "output_tokens": 30,
+            "cache_read_input_tokens": 100,
+        }
+
+    def test_extracts_message_stop_usage(self):
+        usage = {}
+        _scan_sse_usage('data: {"type":"message_stop","usage":{"output_tokens":7}}', usage)
+        assert usage == {"output_tokens": 7}
+
+    def test_ignores_non_usage_events(self):
+        usage = {}
+        _scan_sse_usage('data: {"type":"content_block_delta","index":0}', usage)
+        assert usage == {}
+
+    def test_ignores_non_data_lines(self):
+        usage = {}
+        _scan_sse_usage("event: message_stop", usage)
+        assert usage == {}
+
+    def test_ignores_invalid_json(self):
+        usage = {}
+        _scan_sse_usage("data: not valid json", usage)
+        assert usage == {}
+
+    def test_ignores_non_dict_usage(self):
+        usage = {}
+        _scan_sse_usage('data: {"type":"message_delta","usage":"nope"}', usage)
+        assert usage == {}
+
+    def test_merges_multiple_events(self):
+        usage = {}
+        _scan_sse_usage('data: {"type":"message_delta","usage":{"output_tokens":5}}', usage)
+        _scan_sse_usage('data: {"type":"message_stop","usage":{"input_tokens":10}}', usage)
+        assert usage == {"output_tokens": 5, "input_tokens": 10}
+
+    def test_handles_crlf_line(self):
+        usage = {}
+        _scan_sse_usage(
+            'data: {"type":"message_delta","usage":{"output_tokens":3}}\r', usage
+        )
+        assert usage == {"output_tokens": 3}
+
+
+class TestExtractUsage:
+    def test_copies_from_message_stop(self):
+        usage = {}
+        _extract_usage(
+            {"type": "message_stop", "usage": {"input_tokens": 1, "output_tokens": 2}},
+            usage,
+        )
+        assert usage == {"input_tokens": 1, "output_tokens": 2}
+
+    def test_ignores_other_types(self):
+        usage = {}
+        _extract_usage({"type": "message_start"}, usage)
+        assert usage == {}
+
+    def test_ignores_missing_usage(self):
+        usage = {}
+        _extract_usage({"type": "message_delta"}, usage)
+        assert usage == {}
+
+
+# ---------------------------------------------------------------------------
+# _log_and_track_usage (/usage 计数器累积)
+# ---------------------------------------------------------------------------
+
+
+def _reset_usage_counters():
+    proxy_module._usage.update(requests=0, input_tokens=0, output_tokens=0, cache_read=0)
+    proxy_module._usage_primary.update(requests=0, input_tokens=0, output_tokens=0)
+    proxy_module._usage_subagent.update(requests=0, input_tokens=0, output_tokens=0)
+
+
+class TestLogAndTrackUsage:
+    def test_tracks_primary_usage(self):
+        _reset_usage_counters()
+        _log_and_track_usage(
+            "primary",
+            "deepseek-v4-pro",
+            {
+                "input_tokens": 1000,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 600,
+            },
+        )
+        assert proxy_module._usage == {
+            "requests": 1,
+            "input_tokens": 1000,
+            "output_tokens": 50,
+            "cache_read": 600,
+        }
+        assert proxy_module._usage_primary["requests"] == 1
+        assert proxy_module._usage_primary["input_tokens"] == 1000
+        assert proxy_module._usage_subagent["requests"] == 0
+
+    def test_tracks_subagent_usage(self):
+        _reset_usage_counters()
+        _log_and_track_usage(
+            "subagent",
+            "deepseek-v4-flash",
+            {"input_tokens": 87, "output_tokens": 16},
+        )
+        assert proxy_module._usage_subagent["requests"] == 1
+        assert proxy_module._usage_subagent["output_tokens"] == 16
+        assert proxy_module._usage_primary["requests"] == 0
+
+    def test_empty_usage_not_tracked(self):
+        _reset_usage_counters()
+        _log_and_track_usage("primary", "deepseek-v4-pro", {})
+        assert proxy_module._usage["requests"] == 0
+        assert proxy_module._usage_primary["requests"] == 0
+
+    def test_cache_hit_line_logged(self, caplog):
+        _reset_usage_counters()
+        with caplog.at_level("INFO", logger="deepseek-proxy"):
+            _log_and_track_usage(
+                "primary",
+                "deepseek-v4-pro",
+                {
+                    "input_tokens": 500,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 500,
+                },
+            )
+        assert any("cache_hit=50%" in rec.message for rec in caplog.records)
