@@ -252,9 +252,14 @@ _ERROR_SEVERITY: dict[type, float] = {
     httpx.RemoteProtocolError: 0.5,
 }
 
+# DNS resolution failures get a low non-zero weight: a single transient blip (e.g. VPN
+# fake-ip resolver hiccup) shouldn't trip the circuit, but a sustained DNS outage still
+# accumulates to the threshold so the circuit opens instead of timing out every request.
+_DNS_ERROR_SEVERITY = 0.25
 
-def _is_dns_resolution_error(exc: Exception) -> bool:
-    """True if the exception chain contains a DNS resolution failure (socket.gaierror).
+
+def _dns_error_severity(exc: Exception) -> float | None:
+    """Return the circuit severity for a DNS resolution failure, else None.
 
     httpx wraps socket errors as httpx.ConnectError, chaining the original error via
     ``__cause__`` (httpx.ConnectError → httpcore.ConnectError → socket.gaierror). DNS
@@ -265,9 +270,9 @@ def _is_dns_resolution_error(exc: Exception) -> bool:
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if isinstance(current, socket.gaierror):
-            return True
+            return _DNS_ERROR_SEVERITY
         current = current.__cause__ or current.__context__
-    return False
+    return None
 
 
 def _circuit_prune_window(now: float) -> None:
@@ -341,19 +346,16 @@ def _circuit_failure(exc: Exception):
     now = _time.monotonic()
     _circuit_prune_window(now)
 
-    # DNS resolution failures are environmental (e.g. VPN fake-ip resolver blips),
-    # not upstream overload. Don't count them toward the circuit — the retry loop
-    # already handles transient lookups, and tripping on DNS would 503 everything.
-    if _is_dns_resolution_error(exc):
-        logger.warning("[CB] DNS resolution failure, not counting toward circuit: %s", exc)
-        return
-
     # Reset backoff if enough time has passed since last close
     if _circuit_last_close_at > 0 and (now - _circuit_last_close_at) > CB_BACKOFF_RESET:
         _circuit_backoff_level = 0
 
-    # Grade severity by exception type
-    severity = _ERROR_SEVERITY.get(type(exc), 1.0)
+    # Grade severity by exception type. DNS resolution failures get low weight so a
+    # transient resolver blip doesn't trip the circuit, but a sustained outage still
+    # accumulates to the threshold.
+    severity = _dns_error_severity(exc)
+    if severity is None:
+        severity = _ERROR_SEVERITY.get(type(exc), 1.0)
     _circuit_failure_times.append((now, severity))
     _circuit_failure_weight += severity
 

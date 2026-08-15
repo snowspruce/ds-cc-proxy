@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ds-cc-proxy"
-version = "0.1.25"
+version = "0.1.26"
 description = "DeepSeek Anthropic API 兼容性代理 — 让 Claude Code 在 DeepSeek V4 模型上稳定运行"
 authors = [{name = "snowspruce"}]
 license = {text = "MIT"}

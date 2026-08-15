@@ -10,13 +10,14 @@ import socket
 from unittest.mock import MagicMock
 
 import httpx
+import pytest
 
 from ds_cc_proxy.proxy import (
     _build_response_headers,
+    _dns_error_severity,
     _has_thinking,
     _has_tool_use,
     _inject_thinking_blocks,
-    _is_dns_resolution_error,
     _normalize_thinking,
     _parse_env_float,
     _parse_env_int,
@@ -547,7 +548,7 @@ class TestSummarizeRequest:
 
 
 # ---------------------------------------------------------------------------
-# _is_dns_resolution_error / DNS 熔断分级
+# _dns_error_severity / DNS 熔断分级
 # ---------------------------------------------------------------------------
 
 
@@ -555,15 +556,29 @@ def _make_gaierror():
     return socket.gaierror(8, "nodename nor servname provided, or not known")
 
 
-class TestIsDnsResolutionError:
+def _reset_circuit(proxy):
+    proxy._circuit_failure_times.clear()
+    proxy._circuit_failure_weight = 0.0
+    proxy._circuit_state = "closed"
+    proxy._circuit_backoff_level = 0
+    proxy._circuit_opened_at = 0.0
+    proxy._circuit_last_close_at = 0.0
+
+
+class TestDnsErrorSeverity:
     def test_raw_gaierror(self):
-        assert _is_dns_resolution_error(_make_gaierror()) is True
+        assert _dns_error_severity(_make_gaierror()) is not None
+
+    def test_returns_low_severity_for_gaierror(self):
+        import ds_cc_proxy.proxy as proxy
+
+        assert _dns_error_severity(_make_gaierror()) == proxy._DNS_ERROR_SEVERITY
 
     def test_httpx_wrapped_gaierror(self):
         gai = _make_gaierror()
         wrapped = httpx.ConnectError(str(gai))
         wrapped.__cause__ = gai  # 模拟 httpx `raise ... from exc`
-        assert _is_dns_resolution_error(wrapped) is True
+        assert _dns_error_severity(wrapped) is not None
 
     def test_deep_chain_httpcore_gaierror(self):
         # 真实链路: httpx.ConnectError -> httpcore.ConnectError -> socket.gaierror
@@ -572,41 +587,57 @@ class TestIsDnsResolutionError:
         httpcore_err.__cause__ = gai
         httpx_err = httpx.ConnectError(str(httpcore_err))
         httpx_err.__cause__ = httpcore_err
-        assert _is_dns_resolution_error(httpx_err) is True
+        assert _dns_error_severity(httpx_err) is not None
+
+    def test_context_only_gaierror(self):
+        # `raise ConnectError(...) from None` 会把 gaierror 挂到 __context__ 而非 __cause__
+        gai = _make_gaierror()
+        wrapped = httpx.ConnectError(str(gai))
+        wrapped.__context__ = gai
+        assert _dns_error_severity(wrapped) is not None
 
     def test_connect_error_without_dns(self):
-        assert _is_dns_resolution_error(httpx.ConnectError("Connection refused")) is False
+        assert _dns_error_severity(httpx.ConnectError("Connection refused")) is None
 
     def test_timeout_not_dns(self):
-        assert _is_dns_resolution_error(httpx.TimeoutException("timed out")) is False
+        assert _dns_error_severity(httpx.TimeoutException("timed out")) is None
 
     def test_remote_protocol_error_not_dns(self):
-        assert _is_dns_resolution_error(httpx.RemoteProtocolError("server disconnected")) is False
+        assert _dns_error_severity(httpx.RemoteProtocolError("server disconnected")) is None
 
 
 class TestCircuitFailureDnsGrading:
-    def test_dns_failure_does_not_count_toward_circuit(self):
+    def test_transient_dns_blip_does_not_trip_circuit(self):
         import ds_cc_proxy.proxy as proxy
 
-        proxy._circuit_failure_times.clear()
-        proxy._circuit_failure_weight = 0.0
-        proxy._circuit_state = "closed"
-        proxy._circuit_backoff_level = 0
+        _reset_circuit(proxy)
 
-        for _ in range(proxy.CB_THRESHOLD * 3):
+        for _ in range(proxy.CB_THRESHOLD):
             proxy._circuit_failure(_make_gaierror())
 
-        assert proxy._circuit_failure_weight == 0.0
+        # CB_THRESHOLD 次 DNS 失败 = CB_THRESHOLD * 0.25 权重, 未达到阈值
+        assert proxy._circuit_failure_weight == pytest.approx(
+            proxy.CB_THRESHOLD * proxy._DNS_ERROR_SEVERITY
+        )
         assert proxy._circuit_state == "closed"
-        assert not proxy._circuit_failure_times
+        assert len(proxy._circuit_failure_times) == proxy.CB_THRESHOLD
 
-    def test_non_dns_failure_still_counts(self):
+    def test_sustained_dns_outage_trips_circuit(self):
         import ds_cc_proxy.proxy as proxy
 
-        proxy._circuit_failure_times.clear()
-        proxy._circuit_failure_weight = 0.0
-        proxy._circuit_state = "closed"
-        proxy._circuit_backoff_level = 0
+        _reset_circuit(proxy)
+
+        # 持续 DNS 故障: 需要 int(CB_THRESHOLD / severity) + 1 次才能越过阈值
+        n = int(proxy.CB_THRESHOLD / proxy._DNS_ERROR_SEVERITY) + 1
+        for _ in range(n):
+            proxy._circuit_failure(_make_gaierror())
+
+        assert proxy._circuit_state == "open"
+
+    def test_non_dns_failure_still_counts_at_full_weight(self):
+        import ds_cc_proxy.proxy as proxy
+
+        _reset_circuit(proxy)
 
         proxy._circuit_failure(httpx.ConnectError("Connection refused"))
 
