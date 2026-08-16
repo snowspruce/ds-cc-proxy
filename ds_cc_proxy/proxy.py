@@ -458,10 +458,17 @@ _client_created_at = 0.0
 def _get_client() -> httpx.AsyncClient:
     global _shared_client, _client_created_at
     now = _time.monotonic()
-    if _shared_client is not None and not _shared_client.is_closed:
-        if _client_created_at > 0 and (now - _client_created_at) > CLIENT_MAX_AGE:
-            logger.info("[CLIENT] max age reached (%.0fs), forcing recreate", now - _client_created_at)
-            _shared_client = None
+    if (
+        _shared_client is not None
+        and not _shared_client.is_closed
+        and _client_created_at > 0
+        and (now - _client_created_at) > CLIENT_MAX_AGE
+    ):
+        logger.info(
+            "[CLIENT] max age reached (%.0fs), forcing recreate",
+            now - _client_created_at,
+        )
+        _shared_client = None
     if _shared_client is None or _shared_client.is_closed:
         _shared_client = httpx.AsyncClient(
             timeout=httpx.Timeout(
