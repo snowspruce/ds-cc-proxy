@@ -30,9 +30,6 @@ from collections import deque
 from contextlib import asynccontextmanager
 
 import httpx
-from starlette.applications import Starlette
-from starlette.responses import JSONResponse, StreamingResponse
-from starlette.routing import Route
 
 from ds_cc_proxy._version import VERSION
 
@@ -1079,6 +1076,121 @@ async def proxy(request):
     )
 
 
+# ---- Minimal ASGI shim (replaces Starlette routing + Response) ----
+
+
+class _Headers:
+    """Case-insensitive request headers shim (subset of Starlette API)."""
+
+    def __init__(self, raw: list[tuple[bytes, bytes]]):
+        self._raw = raw
+
+    def items(self) -> list[tuple[str, str]]:
+        return [(k.decode("latin-1"), v.decode("latin-1")) for k, v in self._raw]
+
+    def get(self, key: str, default: str | None = None) -> str | None:
+        key_l = key.lower()
+        for k, v in self._raw:
+            if k.decode("latin-1").lower() == key_l:
+                return v.decode("latin-1")
+        return default
+
+
+class _URL:
+    def __init__(self, path: str):
+        self.path = path
+
+
+class Request:
+    """Request shim exposing the subset of Starlette's Request used by handlers."""
+
+    def __init__(self, scope: dict, receive):
+        self.method = scope.get("method", "")
+        self.url = _URL(scope.get("path", ""))
+        self.headers = _Headers(scope.get("headers", []))
+        self._scope = scope
+        self._receive = receive
+        self._body = b""
+
+    async def body(self) -> bytes:
+        if not self._body:
+            while True:
+                message = await self._receive()
+                if message["type"] == "http.request":
+                    self._body += message.get("body", b"")
+                    if not message.get("more_body", False):
+                        break
+        return self._body
+
+
+class JSONResponse:
+    """JSON response exposing a `.body` bytes attribute (Starlette-compatible)."""
+
+    def __init__(self, content, status_code: int = 200, headers=None):
+        self.body = json.dumps(content, ensure_ascii=False).encode("utf-8")
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.raw_headers = [(b"content-type", b"application/json")]
+        for k, v in self.headers.items():
+            self.raw_headers.append((k.lower().encode("latin-1"), str(v).encode("latin-1")))
+
+
+class StreamingResponse:
+    """Streaming response wrapping an async iterator of byte chunks."""
+
+    def __init__(self, content, status_code: int = 200, headers=None):
+        self.body_iterator = content
+        self.status_code = status_code
+        self.headers = headers or {}
+
+
+def _to_ascii_headers(headers: list[tuple[str, str]]) -> list[tuple[bytes, bytes]]:
+    return [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]
+
+
+async def _send_response(send, response) -> None:
+    """Send a JSONResponse or StreamingResponse over the ASGI `send` callable."""
+    if isinstance(response, StreamingResponse):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": response.status_code,
+                "headers": _to_ascii_headers(list(response.headers.items())),
+            }
+        )
+        async for chunk in response.body_iterator:
+            await send(
+                {"type": "http.response.body", "body": chunk, "more_body": True}
+            )
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+    else:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": response.status_code,
+                "headers": response.raw_headers,
+            }
+        )
+        await send(
+            {"type": "http.response.body", "body": response.body, "more_body": False}
+        )
+
+
+def _route(scope: dict):
+    """Resolve (handler, is_match) for the given ASGI http scope."""
+    path = scope.get("path", "")
+    method = scope.get("method", "")
+    if path == "/health" and method == "GET":
+        return health, True
+    if path == "/usage" and method == "GET":
+        return usage_endpoint, True
+    if path == "/admin/circuit/reset" and method == "POST":
+        return admin_reset_circuit, True
+    if method == "POST":
+        return proxy, True
+    return None, False
+
+
 # ---- Application factory ----
 
 _shutting_down = False
@@ -1103,17 +1215,34 @@ async def lifespan(app):
     logger.info("shutdown complete")
 
 
-def create_app() -> Starlette:
-    return Starlette(
-        lifespan=lifespan,
-        routes=[
-            Route("/health", health, methods=["GET"]),
-            Route("/usage", usage_endpoint, methods=["GET"]),
-            Route("/admin/circuit/reset", admin_reset_circuit, methods=["POST"]),
-            Route(
-                "/{path:path}",
-                proxy,
-                methods=["POST"],
-            ),
-        ],
-    )
+def create_app():
+    """Return a hand-written ASGI callable (replaces Starlette)."""
+
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            cm = None
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    cm = lifespan(None)
+                    await cm.__aenter__()
+                    await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
+                    if cm is not None:
+                        await cm.__aexit__(None, None, None)
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+            return
+
+        if scope["type"] != "http":
+            raise RuntimeError(f"unsupported scope type: {scope['type']}")
+
+        handler, matched = _route(scope)
+        if not matched:
+            response = JSONResponse({"detail": "Not Found"}, status_code=404)
+        else:
+            request = Request(scope, receive)
+            response = await handler(request)
+        await _send_response(send, response)
+
+    return app
