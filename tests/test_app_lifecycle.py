@@ -428,8 +428,10 @@ class TestCreateApp:
 
 def _reset_usage():
     proxy._usage.update(requests=0, input_tokens=0, output_tokens=0, cache_read=0)
-    proxy._usage_primary.update(requests=0, input_tokens=0, output_tokens=0)
-    proxy._usage_subagent.update(requests=0, input_tokens=0, output_tokens=0)
+    proxy._usage_primary.update(requests=0, input_tokens=0, output_tokens=0, cache_read=0)
+    proxy._usage_subagent.update(requests=0, input_tokens=0, output_tokens=0, cache_read=0)
+    proxy._billing = proxy._empty_billing()
+    proxy._billing_subagent = proxy._empty_billing()
 
 
 class TestUsageEndpoint:
@@ -447,7 +449,8 @@ class TestUsageEndpoint:
         assert data["subagent_saved_thinking_tokens"] == 0
         assert data["estimated_saved_usd"] == 0.0
 
-    def test_with_primary_usage(self):
+    def test_with_primary_usage(self, monkeypatch):
+        monkeypatch.setattr(proxy, "_is_peak", lambda now=None: False)  # 闲时定价, 确定性
         _reset_usage()
         proxy._track_usage(
             "primary",
@@ -456,6 +459,7 @@ class TestUsageEndpoint:
                 "output_tokens": 1_000_000,
                 "cache_read_input_tokens": 500_000,
             },
+            "deepseek-v4-pro",
         )
         resp = _run(proxy.usage_endpoint(None))
         data = json.loads(resp.body)
@@ -464,19 +468,23 @@ class TestUsageEndpoint:
         assert data["output_tokens"] == 1_000_000
         # cache_read=500k, input=1M -> cacheable=1.5M -> 500k*100//1.5M = 33
         assert data["cache_hit_pct"] == 33
-        # cost = 1M/1M*0.42 + 1M/1M*0.83 = 1.25
-        assert data["estimated_cost_usd"] == pytest.approx(1.25)
+        # 2026-08-17 峰谷定价 (闲时 pro): miss 1M*4.5 + hit 0.5M*0.15 + out 1M*13.5 = 18.075 元
+        assert data["estimated_cost_rmb"] == pytest.approx(18.075)
+        assert data["estimated_cost_usd"] == pytest.approx(round(18.075 / proxy.RMB_PER_USD, 3))
         assert data["primary"] == {
             "requests": 1,
             "input_tokens": 1_000_000,
             "output_tokens": 1_000_000,
+            "cache_read": 500_000,
         }
 
-    def test_with_subagent_and_savings(self):
+    def test_with_subagent_and_savings(self, monkeypatch):
+        monkeypatch.setattr(proxy, "_is_peak", lambda now=None: False)  # 闲时定价, 确定性
         _reset_usage()
         proxy._track_usage(
             "subagent",
             {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+            "deepseek-v4-flash",
         )
         resp = _run(proxy.usage_endpoint(None))
         data = json.loads(resp.body)
@@ -484,8 +492,9 @@ class TestUsageEndpoint:
         assert data["subagent_saved_thinking_tokens"] == 1_000_000
         # 子代理无缓存 -> cache_hit_pct = 0
         assert data["cache_hit_pct"] == 0
-        # 输入节省 1M*(0.42-0.14)=0.28, 输出节省 1M*0.83=0.83 -> 1.11
-        assert data["estimated_saved_usd"] == pytest.approx(1.11)
+        # 闲时节省: miss 1M*(4.5-1.5)=3 + out 1M*(13.5-4.5)=9 = 12 元
+        assert data["estimated_saved_rmb"] == pytest.approx(12.0)
+        assert data["estimated_saved_usd"] == pytest.approx(round(12.0 / proxy.RMB_PER_USD, 3))
 
 
 # ---------------------------------------------------------------------------

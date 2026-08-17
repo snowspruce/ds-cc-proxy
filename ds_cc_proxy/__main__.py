@@ -84,11 +84,18 @@ def main():
             print(f"Input:        {data['input_tokens']:,} tokens")
             print(f"Output:       {data['output_tokens']:,} tokens")
             print(f"Cache hit:    {data['cache_hit_pct']}%")
-            print(f"Est. cost:    ${data['estimated_cost_usd']}")
-            saved = data["estimated_saved_usd"]
+            print(
+                "Est. cost:    ¥{} (${})".format(
+                    data.get("estimated_cost_rmb", "?"), data.get("estimated_cost_usd", "?")
+                )
+            )
+            saved = data.get("estimated_saved_rmb")
             green = "\033[32m"
             reset = "\033[0m"
-            print(f"Est. saved:   {green}${saved}{reset}")
+            print(f"Est. saved:   {green}¥{saved}{reset}")
+            pricing = data.get("pricing", {})
+            peak = "peak" if data.get("is_peak_now") else "off-peak"
+            print(f"Pricing:      {peak} window (peak/off-peak since {pricing.get('effective', '?')})")
             if data.get("primary"):
                 p = data["primary"]
                 pi, po = p["input_tokens"], p["output_tokens"]

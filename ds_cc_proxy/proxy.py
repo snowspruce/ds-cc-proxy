@@ -146,12 +146,66 @@ _shared_client: httpx.AsyncClient | None = None
 # ---- Usage tracking ----
 
 _usage = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read": 0}
-_usage_primary = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
-_usage_subagent = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+_usage_primary = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read": 0}
+_usage_subagent = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read": 0}
+
+# DeepSeek V4 pricing effective 2026-08-17 (peak/off-peak, RMB per MTok).
+# Peak windows (Beijing time): 09:00-12:00, 14:00-18:00.
+#   V4-Pro:   cache-hit ¥0.30(peak)/¥0.15(off)  miss ¥9.0/¥4.5  out ¥27.0/¥13.5
+#   V4-Flash: cache-hit ¥0.10(peak)/¥0.05(off)  miss ¥3.0/¥1.5  out ¥9.0/¥4.5
+# Source: https://platform.deepseek.com/api-docs/pricing
+PRICES_RMB = {
+    "pro": {
+        "peak": {"hit": 0.30, "miss": 9.0, "out": 27.0},
+        "off": {"hit": 0.15, "miss": 4.5, "out": 13.5},
+    },
+    "flash": {
+        "peak": {"hit": 0.10, "miss": 3.0, "out": 9.0},
+        "off": {"hit": 0.05, "miss": 1.5, "out": 4.5},
+    },
+}
+RMB_PER_USD = 7.2
+PEAK_WINDOWS = ((9, 12), (14, 18))  # Beijing time, [start, end) hours
 
 
-def _track_usage(role: str, usage: dict):
-    global _usage, _usage_primary, _usage_subagent
+def _is_peak(now=None) -> bool:
+    """Whether the given time (or now) falls in a peak billing window (local tz)."""
+    hour = now.tm_hour if now is not None else _time.localtime().tm_hour
+    return any(start <= hour < end for start, end in PEAK_WINDOWS)
+
+
+def _empty_billing() -> dict:
+    """Zeroed peak/off-peak token counters per model family."""
+    return {
+        "pro": {
+            "peak": {"input": 0, "cache_read": 0, "output": 0},
+            "off": {"input": 0, "cache_read": 0, "output": 0},
+        },
+        "flash": {
+            "peak": {"input": 0, "cache_read": 0, "output": 0},
+            "off": {"input": 0, "cache_read": 0, "output": 0},
+        },
+    }
+
+
+_billing = _empty_billing()
+_billing_subagent = _empty_billing()
+
+
+def _billing_cost_rmb(billing: dict) -> float:
+    """Cost in RMB for a billing dict under the current pricing table."""
+    total = 0.0
+    for family, windows in PRICES_RMB.items():
+        for win, prices in windows.items():
+            b = billing[family][win]
+            total += b["input"] / 1e6 * prices["miss"]
+            total += b["cache_read"] / 1e6 * prices["hit"]
+            total += b["output"] / 1e6 * prices["out"]
+    return total
+
+
+def _track_usage(role: str, usage: dict, model: str = ""):
+    global _usage, _usage_primary, _usage_subagent, _billing, _billing_subagent
     inp = usage.get("input_tokens", 0)
     out = usage.get("output_tokens", 0)
     cr = usage.get("cache_read_input_tokens", 0)
@@ -165,6 +219,21 @@ def _track_usage(role: str, usage: dict):
     bucket["requests"] += 1
     bucket["input_tokens"] += inp
     bucket["output_tokens"] += out
+    # .get() 兜底: 旧版字典无 cache_read 键时也能自愈, 而不是 KeyError 掐断响应流
+    bucket["cache_read"] = bucket.get("cache_read", 0) + cr
+
+    # Billing buckets: model family × peak/off-peak window (request completion time)
+    family = "flash" if "flash" in (model or "") else "pro"
+    win = "peak" if _is_peak() else "off"
+    b = _billing[family][win]
+    b["input"] += inp
+    b["cache_read"] += cr
+    b["output"] += out
+    if role == "subagent":
+        sb = _billing_subagent[family][win]
+        sb["input"] += inp
+        sb["cache_read"] += cr
+        sb["output"] += out
 
 
 def _log_and_track_usage(role: str, model: str, response_usage: dict):
@@ -173,7 +242,17 @@ def _log_and_track_usage(role: str, model: str, response_usage: dict):
     Previously only the strip-filtered SSE path tracked usage, so the bulk of
     traffic (thinking-enabled streaming + non-streaming) was invisible to
     /usage and to the cache-hit detection. Call this from every response path.
+
+    Metrics must never break the response: any tracking failure is logged and
+    swallowed (a bug here once killed the stream mid-response).
     """
+    try:
+        _log_and_track_usage_inner(role, model, response_usage)
+    except Exception:
+        logger.exception("[COST] usage tracking failed (response unaffected)")
+
+
+def _log_and_track_usage_inner(role: str, model: str, response_usage: dict):
     if not response_usage:
         logger.info("[COST] role=%s model=%s — no usage fields in response", role, model)
         return
@@ -191,7 +270,7 @@ def _log_and_track_usage(role: str, model: str, response_usage: dict):
         cache_read,
         hit_pct,
     )
-    _track_usage(role, response_usage)
+    _track_usage(role, response_usage, model)
 
 
 async def usage_endpoint(request):
@@ -202,40 +281,24 @@ async def usage_endpoint(request):
     cacheable = inp + cache
     hit_pct = (cache * 100 // cacheable) if cacheable > 0 else 0
 
-    # DeepSeek V4 official pricing (per MTok, USD @ ~7.2 CNY/USD):
-    #   V4-Pro:  input ¥3 ≈ $0.42, output ¥6 ≈ $0.83 (cache miss)
-    #   V4-Flash: input ¥1 ≈ $0.14, output ¥2 ≈ $0.28 (cache miss)
-    # Source: https://platform.deepseek.com/api-docs/pricing
-    price_pro_in = 0.42
-    price_pro_out = 0.83
-    price_flash_in = 0.14
-    price_flash_out = 0.28
+    # Cost under the 2026-08-17 peak/off-peak pricing (includes cache-hit reads).
+    est_rmb = _billing_cost_rmb(_billing)
+
+    # Savings: sub-agent traffic normally runs on Flash instead of Pro — price its
+    # tokens at Pro rates minus the rates actually paid (per model family/peak window).
+    sub_saved_rmb = 0.0
+    for family, windows in _billing_subagent.items():
+        for win, b in windows.items():
+            pp = PRICES_RMB["pro"][win]
+            fp = PRICES_RMB[family][win]
+            sub_saved_rmb += (
+                b["input"] / 1e6 * (pp["miss"] - fp["miss"])
+                + b["cache_read"] / 1e6 * (pp["hit"] - fp["hit"])
+                + b["output"] / 1e6 * (pp["out"] - fp["out"])
+            )
 
     p = _usage_primary
     s = _usage_subagent
-    p_cost = round(
-        p["input_tokens"] / 1_000_000 * price_pro_in
-        + p["output_tokens"] / 1_000_000 * price_pro_out,
-        3,
-    )
-    s_cost = round(
-        s["input_tokens"] / 1_000_000 * price_flash_in
-        + s["output_tokens"] / 1_000_000 * price_flash_out,
-        3,
-    )
-    est_cost = round(p_cost + s_cost, 3)
-
-    # Savings: sub-agents without optimization
-    #   - Would be on Pro (not Flash) → save (price_pro - price_flash) per token
-    #   - budget_tokens=2048 caps thinking at ~2000 tok/req vs default ~4000
-    #     Actual sub-agent output ≈ 50% of unconstrained. Saving ≈ sub_out
-    s_input_saved = round(
-        s["input_tokens"] / 1_000_000 * (price_pro_in - price_flash_in), 3
-    )
-    s_output_saved = round(
-        s["output_tokens"] / 1_000_000 * price_pro_out, 3
-    )
-    s_saved = round(s_input_saved + s_output_saved, 3)
 
     return JSONResponse(
         {
@@ -243,11 +306,23 @@ async def usage_endpoint(request):
             "input_tokens": inp,
             "output_tokens": out,
             "cache_hit_pct": hit_pct,
-            "estimated_cost_usd": est_cost,
+            "estimated_cost_rmb": round(est_rmb, 3),
+            "estimated_cost_usd": round(est_rmb / RMB_PER_USD, 3),
             "primary": None if not p["requests"] else dict(p),
             "subagent": dict(s),
             "subagent_saved_thinking_tokens": s["output_tokens"],
-            "estimated_saved_usd": s_saved,
+            "estimated_saved_rmb": round(sub_saved_rmb, 3),
+            "estimated_saved_usd": round(sub_saved_rmb / RMB_PER_USD, 3),
+            "pricing": {
+                "effective": "2026-08-17",
+                "currency": "rmb_per_mtok",
+                "peak_windows": list(PEAK_WINDOWS),
+                "pro_peak": PRICES_RMB["pro"]["peak"],
+                "pro_off": PRICES_RMB["pro"]["off"],
+                "flash_peak": PRICES_RMB["flash"]["peak"],
+                "flash_off": PRICES_RMB["flash"]["off"],
+            },
+            "is_peak_now": _is_peak(),
         }
     )
 

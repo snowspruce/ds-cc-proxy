@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ds-cc-proxy"
-version = "0.1.26"
+version = "0.1.28"
 description = "DeepSeek Anthropic API 兼容性代理 — 让 Claude Code 在 DeepSeek V4 模型上稳定运行"
 authors = [{name = "snowspruce"}]
 license = {text = "MIT"}
@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.4.0"]
+test = ["pytest>=8.0", "pytest-cov>=5.0", "pytest-asyncio>=0.24", "ruff>=0.4.0"]
 
 [project.urls]
 Homepage = "https://github.com/snowspruce/ds-cc-proxy"

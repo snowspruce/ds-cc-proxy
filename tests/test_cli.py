@@ -136,8 +136,12 @@ class TestMainUsage:
             "input_tokens": 1000,
             "output_tokens": 500,
             "cache_hit_pct": 12.5,
+            "estimated_cost_rmb": 0.07,
             "estimated_cost_usd": 0.01,
+            "estimated_saved_rmb": 0.14,
             "estimated_saved_usd": 0.02,
+            "pricing": {"effective": "2026-08-17"},
+            "is_peak_now": True,
             "primary": {"requests": 6, "input_tokens": 700, "output_tokens": 300},
             "subagent": {"requests": 4, "input_tokens": 300, "output_tokens": 200},
             "subagent_saved_thinking_tokens": 1111,
@@ -156,6 +160,8 @@ class TestMainUsage:
         assert "Requests:" in out
         assert "1,000" in out  # input tokens with comma separator
         assert "12.5%" in out
+        assert "¥0.07" in out  # RMB cost (2026-08-17 pricing)
+        assert "peak window" in out
 
     def test_usage_print_uses_urlopen_timeout(self, monkeypatch, capsys):
         payload = self._usage_payload()

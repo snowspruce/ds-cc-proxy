@@ -7,6 +7,7 @@
 #   - 请求摘要 & 响应头构建
 
 import socket
+import time
 from unittest.mock import MagicMock
 
 import httpx
@@ -14,12 +15,14 @@ import pytest
 
 import ds_cc_proxy.proxy as proxy_module
 from ds_cc_proxy.proxy import (
+    _billing_cost_rmb,
     _build_response_headers,
     _dns_error_severity,
     _extract_usage,
     _has_thinking,
     _has_tool_use,
     _inject_thinking_blocks,
+    _is_peak,
     _log_and_track_usage,
     _normalize_thinking,
     _parse_env_float,
@@ -734,8 +737,10 @@ class TestExtractUsage:
 
 def _reset_usage_counters():
     proxy_module._usage.update(requests=0, input_tokens=0, output_tokens=0, cache_read=0)
-    proxy_module._usage_primary.update(requests=0, input_tokens=0, output_tokens=0)
-    proxy_module._usage_subagent.update(requests=0, input_tokens=0, output_tokens=0)
+    proxy_module._usage_primary.update(requests=0, input_tokens=0, output_tokens=0, cache_read=0)
+    proxy_module._usage_subagent.update(requests=0, input_tokens=0, output_tokens=0, cache_read=0)
+    proxy_module._billing = proxy_module._empty_billing()
+    proxy_module._billing_subagent = proxy_module._empty_billing()
 
 
 class TestLogAndTrackUsage:
@@ -790,3 +795,156 @@ class TestLogAndTrackUsage:
                 },
             )
         assert any("cache_hit=50%" in rec.message for rec in caplog.records)
+
+    def test_tracks_usage_with_pristine_buckets(self):
+        """回归: v0.1.27 事故 — 生产初始化无 cache_read 键时 _track_usage 抛 KeyError,
+        异常从流式 finally 传播导致响应被掐断 (compaction: Connection closed mid-response)。"""
+        proxy_module._usage = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read": 0}
+        proxy_module._usage_primary = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+        proxy_module._usage_subagent = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+        proxy_module._billing = proxy_module._empty_billing()
+        proxy_module._billing_subagent = proxy_module._empty_billing()
+        _log_and_track_usage(
+            "primary",
+            "deepseek-v4-pro",
+            {"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 1},
+        )
+        assert proxy_module._usage_primary["cache_read"] == 1
+        assert proxy_module._usage["requests"] == 1
+
+    def test_tracking_failure_never_raises(self, monkeypatch):
+        """指标统计的任何异常都必须被吞掉, 绝不允许破坏响应流。"""
+        _reset_usage_counters()
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(proxy_module, "_track_usage", boom)
+        _log_and_track_usage("primary", "deepseek-v4-pro", {"input_tokens": 1, "output_tokens": 1})
+        # 不抛异常即通过
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-17 峰谷定价计费
+# ---------------------------------------------------------------------------
+
+
+class TestIsPeak:
+    def _at(self, hour):
+        return time.struct_time((2026, 8, 17, hour, 0, 0, 0, 229, 0))
+
+    def test_peak_morning(self):
+        assert _is_peak(self._at(9)) is True
+        assert _is_peak(self._at(11)) is True
+
+    def test_peak_afternoon(self):
+        assert _is_peak(self._at(14)) is True
+        assert _is_peak(self._at(17)) is True
+
+    def test_off_peak(self):
+        assert _is_peak(self._at(8)) is False
+        assert _is_peak(self._at(12)) is False
+        assert _is_peak(self._at(13)) is False
+        assert _is_peak(self._at(18)) is False
+        assert _is_peak(self._at(0)) is False
+
+
+class TestBillingBuckets:
+    def test_pro_peak_bucket(self, monkeypatch):
+        _reset_usage_counters()
+        monkeypatch.setattr(proxy_module, "_is_peak", lambda now=None: True)
+        _log_and_track_usage(
+            "primary",
+            "deepseek-v4-pro",
+            {"input_tokens": 1000, "output_tokens": 100, "cache_read_input_tokens": 9000},
+        )
+        assert proxy_module._billing["pro"]["peak"] == {
+            "input": 1000,
+            "cache_read": 9000,
+            "output": 100,
+        }
+        assert proxy_module._billing["pro"]["off"] == {"input": 0, "cache_read": 0, "output": 0}
+        assert proxy_module._billing_subagent["pro"]["peak"] == {
+            "input": 0,
+            "cache_read": 0,
+            "output": 0,
+        }
+
+    def test_flash_off_bucket_and_subagent_split(self, monkeypatch):
+        _reset_usage_counters()
+        monkeypatch.setattr(proxy_module, "_is_peak", lambda now=None: False)
+        _log_and_track_usage(
+            "subagent",
+            "deepseek-v4-flash",
+            {"input_tokens": 500, "output_tokens": 50, "cache_read_input_tokens": 4000},
+        )
+        assert proxy_module._billing["flash"]["off"] == {
+            "input": 500,
+            "cache_read": 4000,
+            "output": 50,
+        }
+        assert proxy_module._billing_subagent["flash"]["off"] == {
+            "input": 500,
+            "cache_read": 4000,
+            "output": 50,
+        }
+
+    def test_unknown_model_treated_as_pro(self, monkeypatch):
+        _reset_usage_counters()
+        monkeypatch.setattr(proxy_module, "_is_peak", lambda now=None: True)
+        _log_and_track_usage("primary", "?", {"input_tokens": 10, "output_tokens": 1})
+        assert proxy_module._billing["pro"]["peak"]["input"] == 10
+
+
+class TestBillingCost:
+    def test_cost_rmb_peak_pro(self, monkeypatch):
+        _reset_usage_counters()
+        monkeypatch.setattr(proxy_module, "_is_peak", lambda now=None: True)
+        _log_and_track_usage(
+            "primary",
+            "deepseek-v4-pro",
+            {
+                "input_tokens": 1_000_000,
+                "output_tokens": 1_000_000,
+                "cache_read_input_tokens": 1_000_000,
+            },
+        )
+        # peak pro: miss 9.0 + hit 0.30 + out 27.0 = 36.3
+        assert _billing_cost_rmb(proxy_module._billing) == pytest.approx(36.3)
+
+    def test_cost_rmb_off_flash(self, monkeypatch):
+        _reset_usage_counters()
+        monkeypatch.setattr(proxy_module, "_is_peak", lambda now=None: False)
+        _log_and_track_usage(
+            "primary",
+            "deepseek-v4-flash",
+            {
+                "input_tokens": 1_000_000,
+                "output_tokens": 2_000_000,
+                "cache_read_input_tokens": 3_000_000,
+            },
+        )
+        # off flash: miss 1.5 + out 2*4.5=9.0 + hit 3*0.05=0.15 = 10.65
+        assert _billing_cost_rmb(proxy_module._billing) == pytest.approx(10.65)
+
+    def test_subagent_savings_peak(self, monkeypatch):
+        _reset_usage_counters()
+        monkeypatch.setattr(proxy_module, "_is_peak", lambda now=None: True)
+        _log_and_track_usage(
+            "subagent",
+            "deepseek-v4-flash",
+            {
+                "input_tokens": 1_000_000,
+                "output_tokens": 1_000_000,
+                "cache_read_input_tokens": 1_000_000,
+            },
+        )
+        # peak delta (pro - flash): miss 9-3 + hit 0.30-0.10 + out 27-9 = 24.2
+        sb = proxy_module._billing_subagent["flash"]
+        saved = sum(
+            sb[w]["input"] / 1e6 * (proxy_module.PRICES_RMB["pro"][w]["miss"] - proxy_module.PRICES_RMB["flash"][w]["miss"])
+            + sb[w]["cache_read"] / 1e6 * (proxy_module.PRICES_RMB["pro"][w]["hit"] - proxy_module.PRICES_RMB["flash"][w]["hit"])
+            + sb[w]["output"] / 1e6 * (proxy_module.PRICES_RMB["pro"][w]["out"] - proxy_module.PRICES_RMB["flash"][w]["out"])
+            for w in sb
+        )
+        assert saved == pytest.approx(24.2)
