@@ -143,3 +143,31 @@ async def test_proxy_json_error_passthrough(monkeypatch):
         resp = await c.post("/v1/messages", json={"model": "x", "stream": False})
         assert resp.status_code == 500
         assert b"boom" in resp.content
+
+
+@pytest.mark.asyncio
+async def test_flash_model_routes_as_subagent(monkeypatch):
+    """flash 模型名的请求应按子代理路由到 Flash 上游（不依赖 thinking=disabled）。"""
+    proxy_module._shutting_down = False
+    proxy_module._circuit_state = "closed"
+    proxy_module._circuit_failure_times.clear()
+    proxy_module._circuit_failure_weight = 0.0
+
+    monkeypatch.setattr(proxy_module, "DEEPSEEK_BASE", "https://pro.example.com")
+    monkeypatch.setattr(proxy_module, "DEEPSEEK_FLASH", "https://flash.example.com")
+
+    sse_chunk = b'data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n'
+    fake_resp = _FakeUpstreamResp([sse_chunk])
+    fake_client = _FakeClient(fake_resp)
+    monkeypatch.setattr(proxy_module, "_get_client", lambda: fake_client)
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        payload = {"model": "deepseek-v4-flash", "stream": True}
+        resp = await c.post("/v1/messages", json=payload)
+        assert resp.status_code == 200
+
+    assert fake_client.built is not None
+    method, url, _headers, _content = fake_client.built
+    assert url.startswith("https://flash.example.com")

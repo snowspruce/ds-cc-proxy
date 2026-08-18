@@ -895,7 +895,9 @@ async def proxy(request):
 
             # Capture original thinking type before _normalize_thinking mutates in-place
             thinking_cfg = data.get("thinking", {})
-            is_subagent = isinstance(thinking_cfg, dict) and thinking_cfg.get("type") == "disabled"
+            is_subagent = "flash" in model_name or (
+                isinstance(thinking_cfg, dict) and thinking_cfg.get("type") == "disabled"
+            )
 
             original_thinking_enabled = _thinking_requested(data)
 
