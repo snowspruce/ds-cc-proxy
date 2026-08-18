@@ -4,12 +4,12 @@
 
 **DeepSeek Anthropic API Proxy · Make Claude Code on DeepSeek V4 stabler and cheaper**
 
-[![Version](https://img.shields.io/badge/version-0.1.22-333?style=flat-square)](https://github.com/snowspruce/ds-cc-proxy)
+[![Version](https://img.shields.io/badge/version-0.1.28-333?style=flat-square)](https://github.com/snowspruce/ds-cc-proxy)
 [![Python](https://img.shields.io/badge/python-≥3.11-3776AB?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/ds-cc-proxy/)
 [![License](https://img.shields.io/badge/license-MIT-333?style=flat-square)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-59%20passed-333?style=flat-square)](./tests/)
-[![Size](https://img.shields.io/badge/size-~650%20LOC-333?style=flat-square)](./ds_cc_proxy/)
-[![Deps](https://img.shields.io/badge/deps-3-333?style=flat-square)](./pyproject.toml)
+[![Tests](https://img.shields.io/badge/tests-164%20passed-333?style=flat-square)](./tests/)
+[![Size](https://img.shields.io/badge/size-~1.5K%20LOC-333?style=flat-square)](./ds_cc_proxy/)
+[![Deps](https://img.shields.io/badge/deps-2-333?style=flat-square)](./pyproject.toml)
 
 <br>
 
@@ -28,6 +28,8 @@ Claude Code ←→ localhost:16889 ←→ api.deepseek.com/anthropic
 > 40% cheaper sub-agents. Zero quality loss on primary sessions. Fewer failures than calling DeepSeek directly.
 >
 > **How?** Read the `thinking` field from Claude Code. Route sub-agents (`disabled`) to Flash with `budget_tokens=2048`. Passthrough primary sessions (`enabled`/`adaptive`) untouched.
+>
+> Since DeepSeek V4's 2026-08-17 peak/off-peak pricing, `/usage` reports cost in ¥ (RMB) split across peak windows with cache hit rate — so you can see exactly where tokens and money go.
 
 | Request Type | Primary Session | Sub-agent |
 |---|---|---|
@@ -63,10 +65,12 @@ Add to `~/.claude/settings.json` under `env`:
 
 ```bash
 curl http://localhost:16889/health
-# {"status":"ok","version":"0.1.22","upstream":"https://api.deepseek.com/anthropic"}
+# {"status":"ok","version":"0.1.28","upstream":"https://api.deepseek.com/anthropic","circuit":"closed"}
 
 curl http://localhost:16889/usage
-# {"requests":247,"input_tokens":1200000,"output_tokens":340000,"estimated_cost_usd":0.87,...}
+# {"requests":247,"input_tokens":1200000,"output_tokens":340000,"cache_hit_pct":98,
+#  "estimated_cost_rmb":1.24,"estimated_cost_usd":0.17,
+#  "pricing":{"effective":"2026-08-17","is_peak_now":false,...}}
 ```
 
 ---
@@ -81,21 +85,29 @@ curl http://localhost:16889/usage
 | `PROXY_HOST` | `127.0.0.1` | Listen address |
 | `PROXY_PORT` | `16889` | Listen port |
 | `PROXY_LOG_LEVEL` | `warning` | `debug` / `info` / `warning` / `error` |
+| `PROXY_LOG_FILE` | *(empty)* | Log file path (empty = stdout only) |
+| `PROXY_LOG_MAX_BYTES` | `10485760` | Max log file size (10MB) |
+| `PROXY_LOG_BACKUP_COUNT` | `3` | Log rotation backup count |
+| `PROXY_MAX_BODY_BYTES` | `10485760` | Max request body size (10MB) |
+| `PROXY_DUMP_DIR` | *(empty)* | Traffic dump (contains secrets, debug only) |
 | `PROXY_POOL_MAX_CONNECTIONS` | `50` | Upstream pool max connections |
 | `PROXY_POOL_MAX_KEEPALIVE` | `20` | Max keep-alive connections |
 | `PROXY_POOL_TIMEOUT` | `120.0` | Pool queue timeout (seconds) |
 | `PROXY_UPSTREAM_TIMEOUT` | `600.0` | Per-request upstream timeout (seconds) |
 | `PROXY_CONNECT_TIMEOUT` | `10.0` | TCP connect timeout (seconds) |
-| `PROXY_MAX_BODY_BYTES` | `10485760` | Max request body size (10MB) |
+| `PROXY_CLIENT_MAX_AGE` | `300.0` | Max client connection age (seconds) |
 | `PROXY_RETRY_MAX` | `3` | Max retry attempts on transient failures |
 | `PROXY_RETRY_BACKOFF` | `1.0` | Base backoff seconds per retry (exponential) |
-| `PROXY_CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures before circuit opens |
-| `PROXY_CIRCUIT_BREAKER_TIMEOUT` | `30.0` | Seconds circuit stays open before half-open trial |
-| `PROXY_DUMP_DIR` | *(empty)* | Traffic dump (contains secrets, debug only) |
+| `PROXY_CB_THRESHOLD` | `8` | Consecutive failures before circuit opens |
+| `PROXY_CB_WINDOW` | `60.0` | Failure-count window (seconds) |
+| `PROXY_CB_TIMEOUT_BASE` | `30.0` | Base seconds circuit stays open |
+| `PROXY_CB_TIMEOUT_MAX` | `300.0` | Max circuit-open seconds (exponential backoff) |
+| `PROXY_CB_BACKOFF_RESET` | `600.0` | Healthy seconds before circuit resets |
+| `PROXY_CB_HEALTH_INTERVAL` | `15.0` | Half-open health check interval (seconds) |
 
 ### Reliability · Retry + Circuit Breaker
 
-Transient failures (network blips, 502/503) are retried automatically with exponential backoff. After `PROXY_CIRCUIT_BREAKER_THRESHOLD` consecutive failures, the circuit opens — all requests immediately return 503 until a half-open trial succeeds. No more cascading timeouts.
+Transient failures (network blips, 502/503) are retried automatically with exponential backoff. After `PROXY_CB_THRESHOLD` consecutive failures within `PROXY_CB_WINDOW`, the circuit opens — all requests immediately return 503 until a half-open health check (`PROXY_CB_HEALTH_INTERVAL`) succeeds. No more cascading timeouts.
 
 <a id="comparison"></a>
 ##  Comparison
@@ -103,7 +115,7 @@ Transient failures (network blips, 502/503) are retried automatically with expon
 | | **ds-cc-proxy** | LiteLLM | CCR | OpenRouter |
 |---|---|---|---|---|
 | Focus | DeepSeek specialist | General gateway | Multi-provider | Hosted aggregator |
-| Footprint | ~650 LOC · 3 deps | ~10K+ LOC · 50+ deps | ~5K+ LOC · 80+ deps | SaaS |
+| Footprint | ~1.5K LOC · 2 deps | ~10K+ LOC · 50+ deps | ~5K+ LOC · 80+ deps | SaaS |
 | Auditable | ✅ 10-minute read | ❌ Days | ❌ Hours | ❌ Closed source |
 | Thinking adapters | ✅ Inject / strip / adaptive | ⚠️ Partial | ❌ Via plugin | ❌ |
 | Sub-agent cost opt. | ✅ Flash + budget control | ❌ | ❌ | ❌ |

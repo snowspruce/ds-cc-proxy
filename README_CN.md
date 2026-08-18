@@ -4,12 +4,12 @@
 
 **DeepSeek Anthropic API 代理 · 让 Claude Code 在 DeepSeek V4 上更稳、更省**
 
-[![Version](https://img.shields.io/badge/版本-0.1.22-333?style=flat-square)](https://github.com/snowspruce/ds-cc-proxy)
+[![Version](https://img.shields.io/badge/版本-0.1.28-333?style=flat-square)](https://github.com/snowspruce/ds-cc-proxy)
 [![Python](https://img.shields.io/badge/python-≥3.11-3776AB?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/ds-cc-proxy/)
 [![License](https://img.shields.io/badge/license-MIT-333?style=flat-square)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-59%20passed-333?style=flat-square)](./tests/)
-[![Size](https://img.shields.io/badge/代码量-~650%20LOC-333?style=flat-square)](./ds_cc_proxy/)
-[![Deps](https://img.shields.io/badge/依赖-3-333?style=flat-square)](./pyproject.toml)
+[![Tests](https://img.shields.io/badge/tests-164%20passed-333?style=flat-square)](./tests/)
+[![Size](https://img.shields.io/badge/代码量-~1.5K%20LOC-333?style=flat-square)](./ds_cc_proxy/)
+[![Deps](https://img.shields.io/badge/依赖-2-333?style=flat-square)](./pyproject.toml)
 
 <br>
 
@@ -28,6 +28,8 @@ Claude Code ←→ localhost:16889 ←→ api.deepseek.com/anthropic
 > 子代理成本降 40%。主会话质量零损失。比直连 DeepSeek API 更少的请求失败。
 >
 > **怎么做到的？** 读取 Claude Code 请求中的 `thinking` 字段。子代理 (`disabled`) 路由到 Flash + `budget_tokens=2048`。主会话 (`enabled`/`adaptive`) 原封不动透传。
+>
+> 自 DeepSeek V4 于 2026-08-17 实行峰谷定价后，`/usage` 会按高峰/闲时窗口以 ¥（人民币）拆分计费并统计缓存命中率——让你看清 token 和钱都花在哪了。
 
 | 请求类型 | 主会话 | 子代理 |
 |---|---|---|
@@ -63,10 +65,12 @@ ds-cc-proxy --stop            # 停止
 
 ```bash
 curl http://localhost:16889/health
-# {"status":"ok","version":"0.1.22","upstream":"https://api.deepseek.com/anthropic"}
+# {"status":"ok","version":"0.1.28","upstream":"https://api.deepseek.com/anthropic","circuit":"closed"}
 
 curl http://localhost:16889/usage
-# {"requests":247,"input_tokens":1200000,"output_tokens":340000,"estimated_cost_usd":0.87,...}
+# {"requests":247,"input_tokens":1200000,"output_tokens":340000,"cache_hit_pct":98,
+#  "estimated_cost_rmb":1.24,"estimated_cost_usd":0.17,
+#  "pricing":{"effective":"2026-08-17","is_peak_now":false,...}}
 ```
 
 ---
@@ -81,12 +85,29 @@ curl http://localhost:16889/usage
 | `PROXY_HOST` | `127.0.0.1` | 监听地址 |
 | `PROXY_PORT` | `16889` | 监听端口 |
 | `PROXY_LOG_LEVEL` | `warning` | `debug` / `info` / `warning` / `error` |
+| `PROXY_LOG_FILE` | *(空)* | 日志文件路径（空 = 仅输出到 stdout） |
+| `PROXY_LOG_MAX_BYTES` | `10485760` | 日志文件最大字节数（10MB） |
+| `PROXY_LOG_BACKUP_COUNT` | `3` | 日志滚动备份数量 |
+| `PROXY_MAX_BODY_BYTES` | `10485760` | 请求体最大字节数（10MB） |
+| `PROXY_DUMP_DIR` | *(空)* | 流量捕获（含敏感数据，仅调试用） |
 | `PROXY_POOL_MAX_CONNECTIONS` | `50` | 上游连接池上限 |
 | `PROXY_POOL_MAX_KEEPALIVE` | `20` | 最大保活连接数 |
 | `PROXY_POOL_TIMEOUT` | `120.0` | 池满排队超时（秒） |
 | `PROXY_UPSTREAM_TIMEOUT` | `600.0` | 单次上游请求超时（秒） |
 | `PROXY_CONNECT_TIMEOUT` | `10.0` | TCP 连接超时（秒） |
-| `PROXY_DUMP_DIR` | *(空)* | 流量捕获（含敏感数据，仅调试用） |
+| `PROXY_CLIENT_MAX_AGE` | `300.0` | 客户端连接最大存活时间（秒） |
+| `PROXY_RETRY_MAX` | `3` | 瞬时故障最大重试次数 |
+| `PROXY_RETRY_BACKOFF` | `1.0` | 每次重试的基础退避秒数（指数增长） |
+| `PROXY_CB_THRESHOLD` | `8` | 连续失败多少次后打开熔断 |
+| `PROXY_CB_WINDOW` | `60.0` | 失败计数窗口（秒） |
+| `PROXY_CB_TIMEOUT_BASE` | `30.0` | 熔断基础保持时间（秒） |
+| `PROXY_CB_TIMEOUT_MAX` | `300.0` | 熔断最长保持时间（秒，指数退避） |
+| `PROXY_CB_BACKOFF_RESET` | `600.0` | 健康多久后重置熔断（秒） |
+| `PROXY_CB_HEALTH_INTERVAL` | `15.0` | 半开状态健康检查间隔（秒） |
+
+### 可靠性 · 重试 + 熔断器
+
+瞬时故障（网络抖动、502/503）会自动按指数退避重试。在 `PROXY_CB_WINDOW` 内连续失败 `PROXY_CB_THRESHOLD` 次后，熔断器打开——所有请求立即返回 503，直到半开状态的健康检查（`PROXY_CB_HEALTH_INTERVAL`）成功。不再出现级联超时。
 
 ---
 
@@ -96,7 +117,7 @@ curl http://localhost:16889/usage
 | | **ds-cc-proxy** | LiteLLM | CCR | OpenRouter |
 |---|---|---|---|---|
 | 定位 | DeepSeek 专项 | 通用企业网关 | 多供应商路由 | 托管聚合平台 |
-| 体量 | ~650 LOC · 3 依赖 | ~10K+ LOC · 50+ 依赖 | ~5K+ LOC · 80+ 依赖 | SaaS |
+| 体量 | ~1.5K LOC · 2 依赖 | ~10K+ LOC · 50+ 依赖 | ~5K+ LOC · 80+ 依赖 | SaaS |
 | 可审计 | ✅ 10 分钟通读 | ❌ 数天 | ❌ 半天 | ❌ 闭源 |
 | thinking 适配 | ✅ 注入/剥离/adaptive | ⚠️ 部分 | ❌ 需插件 | ❌ |
 | 子代理降本 | ✅ Flash 路由 + 预算控制 | ❌ | ❌ | ❌ |
