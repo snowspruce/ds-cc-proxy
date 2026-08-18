@@ -799,7 +799,12 @@ class TestLogAndTrackUsage:
     def test_tracks_usage_with_pristine_buckets(self):
         """回归: v0.1.27 事故 — 生产初始化无 cache_read 键时 _track_usage 抛 KeyError,
         异常从流式 finally 传播导致响应被掐断 (compaction: Connection closed mid-response)。"""
-        proxy_module._usage = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read": 0}
+        proxy_module._usage = {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read": 0,
+        }
         proxy_module._usage_primary = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
         proxy_module._usage_subagent = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
         proxy_module._billing = proxy_module._empty_billing()
@@ -941,10 +946,12 @@ class TestBillingCost:
         )
         # peak delta (pro - flash): miss 9-3 + hit 0.30-0.10 + out 27-9 = 24.2
         sb = proxy_module._billing_subagent["flash"]
+        pro_price = proxy_module.PRICES_RMB["pro"]
+        flash_price = proxy_module.PRICES_RMB["flash"]
         saved = sum(
-            sb[w]["input"] / 1e6 * (proxy_module.PRICES_RMB["pro"][w]["miss"] - proxy_module.PRICES_RMB["flash"][w]["miss"])
-            + sb[w]["cache_read"] / 1e6 * (proxy_module.PRICES_RMB["pro"][w]["hit"] - proxy_module.PRICES_RMB["flash"][w]["hit"])
-            + sb[w]["output"] / 1e6 * (proxy_module.PRICES_RMB["pro"][w]["out"] - proxy_module.PRICES_RMB["flash"][w]["out"])
+            sb[w]["input"] / 1e6 * (pro_price[w]["miss"] - flash_price[w]["miss"])
+            + sb[w]["cache_read"] / 1e6 * (pro_price[w]["hit"] - flash_price[w]["hit"])
+            + sb[w]["output"] / 1e6 * (pro_price[w]["out"] - flash_price[w]["out"])
             for w in sb
         )
         assert saved == pytest.approx(24.2)

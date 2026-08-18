@@ -95,7 +95,8 @@ def main():
             print(f"Est. saved:   {green}¥{saved}{reset}")
             pricing = data.get("pricing", {})
             peak = "peak" if data.get("is_peak_now") else "off-peak"
-            print(f"Pricing:      {peak} window (peak/off-peak since {pricing.get('effective', '?')})")
+            effective = pricing.get("effective", "?")
+            print(f"Pricing:      {peak} window (peak/off-peak since {effective})")
             if data.get("primary"):
                 p = data["primary"]
                 pi, po = p["input_tokens"], p["output_tokens"]
