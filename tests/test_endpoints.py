@@ -68,6 +68,11 @@ async def test_usage_endpoint_structure(client):
     assert isinstance(data["subagent"], dict)
     for key in ("requests", "input_tokens", "output_tokens"):
         assert key in data["subagent"]
+    # 按模型拆分的 token 计数 (pro/flash × input/cache_read/output)
+    assert set(data["models"]) == {"pro", "flash"}
+    for family in ("pro", "flash"):
+        for key in ("input", "cache_read", "output"):
+            assert isinstance(data["models"][family][key], int)
 
 
 class _FakeUpstreamResp:

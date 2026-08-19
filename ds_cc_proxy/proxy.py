@@ -300,6 +300,15 @@ async def usage_endpoint(request):
     p = _usage_primary
     s = _usage_subagent
 
+    models = {
+        fam: {
+            "input": sum(w["input"] for w in wins.values()),
+            "cache_read": sum(w["cache_read"] for w in wins.values()),
+            "output": sum(w["output"] for w in wins.values()),
+        }
+        for fam, wins in _billing.items()
+    }
+
     return JSONResponse(
         {
             "requests": n,
@@ -308,6 +317,7 @@ async def usage_endpoint(request):
             "cache_hit_pct": hit_pct,
             "estimated_cost_rmb": round(est_rmb, 3),
             "estimated_cost_usd": round(est_rmb / RMB_PER_USD, 3),
+            "models": models,
             "primary": None if not p["requests"] else dict(p),
             "subagent": dict(s),
             "subagent_saved_thinking_tokens": s["output_tokens"],
