@@ -5,7 +5,7 @@ Local proxy for Claude Code on DeepSeek V4: sub-agents move to Flash, primary se
 Python ≥ 3.11 · MIT · 164 tests · ~1.5K LOC · 2 dependencies · [中文](./README_CN.md)
 
 ```
-Claude Code ←→ 127.0.0.1:16889 ←→ api.deepseek.com/anthropic
+Claude Code ←→ localhost:16889 ←→ api.deepseek.com/anthropic
 ```
 
 ---

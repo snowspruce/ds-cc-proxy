@@ -5,7 +5,7 @@ Claude Code 接 DeepSeek V4 时的本地代理：子代理走 Flash，主会话�
 Python ≥ 3.11 · MIT · 164 测试 · ~1.5K LOC · 2 依赖 · [English](./README.md)
 
 ```
-Claude Code ←→ 127.0.0.1:16889 ←→ api.deepseek.com/anthropic
+Claude Code ←→ localhost:16889 ←→ api.deepseek.com/anthropic
 ```
 
 ---
