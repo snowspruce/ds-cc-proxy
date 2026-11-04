@@ -1,67 +1,32 @@
-<div align="center">
-
 # ds-cc-proxy
 
-**DeepSeek Anthropic API 代理 · 让 Claude Code 在 DeepSeek V4 上更稳、更省**
+Claude Code 接 DeepSeek V4 时的本地代理：子代理走 Flash，主会话原样透传。
 
-[![Version](https://img.shields.io/badge/版本-0.1.28-333?style=flat-square)](https://github.com/snowspruce/ds-cc-proxy)
-[![Python](https://img.shields.io/badge/python-≥3.11-3776AB?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/ds-cc-proxy/)
-[![License](https://img.shields.io/badge/license-MIT-333?style=flat-square)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-164%20passed-333?style=flat-square)](./tests/)
-[![Size](https://img.shields.io/badge/代码量-~1.5K%20LOC-333?style=flat-square)](./ds_cc_proxy/)
-[![Deps](https://img.shields.io/badge/依赖-2-333?style=flat-square)](./pyproject.toml)
-
-<br>
+Python ≥ 3.11 · MIT · 164 测试 · ~1.5K LOC · 2 依赖 · [English](./README.md)
 
 ```
-Claude Code ←→ localhost:16889 ←→ api.deepseek.com/anthropic
+Claude Code ←→ 127.0.0.1:16889 ←→ api.deepseek.com/anthropic
 ```
-
-[快速开始](#quick-start) · [对比](#comparison) · [English](./README.md)
-
-</div>
 
 ---
 
-## &nbsp;
-
-> 子代理成本降 40%。主会话质量零损失。比直连 DeepSeek API 更少的请求失败。
->
-> **怎么做到的？** 读取 Claude Code 请求中的 `thinking` 字段。子代理 (`disabled`) 路由到 Flash + `budget_tokens=2048`。主会话 (`enabled`/`adaptive`) 原封不动透传。
->
-> 自 DeepSeek V4 于 2026-08-17 实行峰谷定价后，`/usage` 会按高峰/闲时窗口以 ¥（人民币）拆分计费并统计缓存命中率——让你看清 token 和钱都花在哪了。
-
-| 请求类型 | 主会话 | 子代理 |
-|---|---|---|
-| CC 发送的 `thinking` | `enabled` / `adaptive` | `disabled` |
-| CC 的意图 | 深度推理 | 快速执行 |
-| 代理路由 | Pro 模型 · 原始预算 | Flash 模型 · `budget_tokens=2048` |
-| 为什么 | 透传——不损害推理质量 | DeepSeek 要求 `enabled`，最小预算满足兼容即可 |
-
-**质量不是妥协了——是提升了。** ds-cc-proxy 修复了直连 DeepSeek Anthropic API 的 12 个兼容性缺陷：thinking 模式隔离、SSE 解析边界情况、连接池耗尽、请求头泄漏、非法环境变量崩溃等。
-
----
-
-## &nbsp;
-
-<a id="quick-start"></a>
-##  快速开始
-
-<div align="center">
+## 安装
 
 ```bash
 pip install ds-cc-proxy      # 或 pipx / uv tool install
-ds-cc-proxy                   # 启动
-ds-cc-proxy --stop            # 停止
+ds-cc-proxy                  # 启动
+ds-cc-proxy --stop           # 停止
 ```
-
-</div>
 
 在 `~/.claude/settings.json` 的 `env` 中添加：
 
 ```json
 "ANTHROPIC_BASE_URL": "http://localhost:16889"
 ```
+
+---
+
+## 使用
 
 ```bash
 curl http://localhost:16889/health
@@ -73,9 +38,29 @@ curl http://localhost:16889/usage
 #  "pricing":{"effective":"2026-08-17","is_peak_now":false,...}}
 ```
 
+DeepSeek V4 自 2026-08-17 起实行峰谷定价，`/usage` 按高峰窗口以 ¥ 拆分计费并给出缓存命中率。
+
 ---
 
-##  环境变量
+## 工作方式
+
+代理读取 Claude Code 请求里已有的 `thinking` 字段，按它分流：
+
+| 请求类型 | 主会话 | 子代理 |
+|---|---|---|
+| Claude Code 发送的 `thinking` | `enabled` / `adaptive` | `disabled` |
+| 意图 | 深度推理 | 快速执行 |
+| 路由 | Pro 模型，原始预算 | Flash 模型，`budget_tokens=2048` |
+| 理由 | 透传，不影响质量 | DeepSeek 要求 `enabled`，最小预算即可满足 |
+
+子代理成本下降 40%，主会话质量不变。
+
+同时修复直连 DeepSeek Anthropic API 的 12 个兼容性缺陷：thinking 模式隔离、SSE 解析边界、
+连接池耗尽、请求头泄漏、非法环境变量崩溃等。
+
+---
+
+## 配置
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
@@ -105,40 +90,36 @@ curl http://localhost:16889/usage
 | `PROXY_CB_BACKOFF_RESET` | `600.0` | 健康多久后重置熔断（秒） |
 | `PROXY_CB_HEALTH_INTERVAL` | `15.0` | 半开状态健康检查间隔（秒） |
 
-### 可靠性 · 重试 + 熔断器
-
-瞬时故障（网络抖动、502/503）会自动按指数退避重试。在 `PROXY_CB_WINDOW` 内连续失败 `PROXY_CB_THRESHOLD` 次后，熔断器打开——所有请求立即返回 503，直到半开状态的健康检查（`PROXY_CB_HEALTH_INTERVAL`）成功。不再出现级联超时。
+瞬时故障（网络抖动、502/503）按指数退避重试。在 `PROXY_CB_WINDOW` 内连续失败
+`PROXY_CB_THRESHOLD` 次后熔断打开：所有请求立即返回 503，直到半开状态的健康检查
+（`PROXY_CB_HEALTH_INTERVAL`）成功。
 
 ---
 
-<a id="comparison"></a>
-##  同类工具对比
+## 同类工具对比
 
-| | **ds-cc-proxy** | LiteLLM | CCR | OpenRouter |
+| | ds-cc-proxy | LiteLLM | CCR | OpenRouter |
 |---|---|---|---|---|
 | 定位 | DeepSeek 专项 | 通用企业网关 | 多供应商路由 | 托管聚合平台 |
 | 体量 | ~1.5K LOC · 2 依赖 | ~10K+ LOC · 50+ 依赖 | ~5K+ LOC · 80+ 依赖 | SaaS |
-| 可审计 | ✅ 10 分钟通读 | ❌ 数天 | ❌ 半天 | ❌ 闭源 |
-| thinking 适配 | ✅ 注入/剥离/adaptive | ⚠️ 部分 | ❌ 需插件 | ❌ |
-| 子代理降本 | ✅ Flash 路由 + 预算控制 | ❌ | ❌ | ❌ |
-| SSE 解析容错 | ✅ 多重类型守卫 | ✅ | ⚠️ 通用处理 | ❌ |
-| 安全加固 | ✅ 12 项修复 | ✅ 企业级 | ⚠️ 基础 | N/A |
+| 可审计 | 是，10 分钟通读 | 否，数天 | 否，半天 | 否，闭源 |
+| thinking 适配 | 注入 / 剥离 / adaptive | 部分 | 需插件 | 否 |
+| 子代理降本 | Flash 路由 + 预算控制 | 否 | 否 | 否 |
+| SSE 解析容错 | 多重类型守卫 | 是 | 通用处理 | 否 |
+| 安全加固 | 12 项修复 | 企业级 | 基础 | N/A |
 
-> **选 ds-cc-proxy**：DeepSeek 是你的主力模型，要稳定、省成本、不折腾。
->
-> **选 LiteLLM / CCR / OpenRouter**：需要多供应商切换、企业级权限管理、或不用 DeepSeek thinking。
-
----
-
-##  与本地代理共存
-
-ds-cc-proxy (`127.0.0.1:16889`) 只处理 Claude Code 流量。Clash Verge、V2Ray 等系统代理工作在不同网络层——同时运行，无需特殊配置。
+DeepSeek 是主力模型、要稳定与省成本且不想配置，选 ds-cc-proxy。需要多供应商切换、
+企业级权限管理，或不用 DeepSeek thinking 模式，选 LiteLLM、CCR 或 OpenRouter。
 
 ---
 
-##  项目由来
+## 附注
 
-Fork 自 [HosheaLi/P14_dsv4ToCC](https://github.com/HosheaLi/P14_dsv4ToCC) v1.8.0。早期版本以 `dsv4-cc-proxy` 发布。v0.1.22 更名为 `ds-cc-proxy`。升级命令：
+`127.0.0.1:16889` 只处理 Claude Code 流量。Clash Verge、V2Ray 等系统代理工作在不同网络层，
+两者同时运行，无需配置。
+
+Fork 自 [HosheaLi/P14_dsv4ToCC](https://github.com/HosheaLi/P14_dsv4ToCC) v1.8.0。早期版本
+以 `dsv4-cc-proxy` 发布，v0.1.22 更名。
 
 ```bash
 pip uninstall dsv4-cc-proxy && pip install ds-cc-proxy
@@ -146,10 +127,4 @@ pip uninstall dsv4-cc-proxy && pip install ds-cc-proxy
 
 ---
 
-<div align="center">
-
-## License
-
-MIT · [snowspruce/ds-cc-proxy](https://github.com/snowspruce/ds-cc-proxy) · [English](./README.md)
-
-</div>
+MIT

@@ -1,67 +1,32 @@
-<div align="center">
-
 # ds-cc-proxy
 
-**DeepSeek Anthropic API Proxy · Make Claude Code on DeepSeek V4 stabler and cheaper**
+Local proxy for Claude Code on DeepSeek V4: sub-agents move to Flash, primary sessions pass through unchanged.
 
-[![Version](https://img.shields.io/badge/version-0.1.28-333?style=flat-square)](https://github.com/snowspruce/ds-cc-proxy)
-[![Python](https://img.shields.io/badge/python-≥3.11-3776AB?style=flat-square&logo=python&logoColor=white)](https://pypi.org/project/ds-cc-proxy/)
-[![License](https://img.shields.io/badge/license-MIT-333?style=flat-square)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-164%20passed-333?style=flat-square)](./tests/)
-[![Size](https://img.shields.io/badge/size-~1.5K%20LOC-333?style=flat-square)](./ds_cc_proxy/)
-[![Deps](https://img.shields.io/badge/deps-2-333?style=flat-square)](./pyproject.toml)
-
-<br>
+Python ≥ 3.11 · MIT · 164 tests · ~1.5K LOC · 2 dependencies · [中文](./README_CN.md)
 
 ```
-Claude Code ←→ localhost:16889 ←→ api.deepseek.com/anthropic
+Claude Code ←→ 127.0.0.1:16889 ←→ api.deepseek.com/anthropic
 ```
-
-[Quick Start](#quick-start) · [Comparison](#comparison) · [中文](./README_CN.md)
-
-</div>
 
 ---
 
-## &nbsp;
-
-> 40% cheaper sub-agents. Zero quality loss on primary sessions. Fewer failures than calling DeepSeek directly.
->
-> **How?** Read the `thinking` field from Claude Code. Route sub-agents (`disabled`) to Flash with `budget_tokens=2048`. Passthrough primary sessions (`enabled`/`adaptive`) untouched.
->
-> Since DeepSeek V4's 2026-08-17 peak/off-peak pricing, `/usage` reports cost in ¥ (RMB) split across peak windows with cache hit rate — so you can see exactly where tokens and money go.
-
-| Request Type | Primary Session | Sub-agent |
-|---|---|---|
-| CC sends `thinking` | `enabled` / `adaptive` | `disabled` |
-| CC's intent | Deep reasoning | Quick execution |
-| Proxy routes to | Pro model · original budget | Flash model · `budget_tokens=2048` |
-| Why | Passthrough — no quality impact | DeepSeek requires `enabled`; minimal budget satisfies API |
-
-**Quality is not compromised — it's improved.** ds-cc-proxy fixes 12 compatibility bugs in the raw DeepSeek Anthropic API: thinking mode isolation, SSE parsing edge cases, connection pool exhaustion, header leakage, crash-on-invalid-env, and more.
-
----
-
-## &nbsp;
-
-<a id="quick-start"></a>
-##  Quick Start
-
-<div align="center">
+## Install
 
 ```bash
 pip install ds-cc-proxy      # or pipx / uv tool install
-ds-cc-proxy                   # start
-ds-cc-proxy --stop            # stop
+ds-cc-proxy                  # start
+ds-cc-proxy --stop           # stop
 ```
 
-</div>
-
-Add to `~/.claude/settings.json` under `env`:
+Add to `env` in `~/.claude/settings.json`:
 
 ```json
 "ANTHROPIC_BASE_URL": "http://localhost:16889"
 ```
+
+---
+
+## Usage
 
 ```bash
 curl http://localhost:16889/health
@@ -73,9 +38,31 @@ curl http://localhost:16889/usage
 #  "pricing":{"effective":"2026-08-17","is_peak_now":false,...}}
 ```
 
+Since DeepSeek V4 peak/off-peak pricing (2026-08-17), `/usage` reports cost in ¥ split across
+peak windows, with cache hit rate.
+
 ---
 
-##  Environment Variables
+## How it works
+
+The proxy reads the `thinking` field Claude Code already sends, and routes on it:
+
+| Request type | Primary session | Sub-agent |
+|---|---|---|
+| `thinking` sent by Claude Code | `enabled` / `adaptive` | `disabled` |
+| Intent | Deep reasoning | Quick execution |
+| Route | Pro model, original budget | Flash model, `budget_tokens=2048` |
+| Reason | Pass-through, no quality impact | DeepSeek requires `enabled`; a minimal budget satisfies it |
+
+Sub-agent cost drop: 40%. Primary-session quality is untouched.
+
+It also fixes 12 compatibility defects in the raw DeepSeek Anthropic API: thinking-mode
+isolation, SSE parsing edge cases, connection pool exhaustion, header leakage,
+crash-on-invalid-env, and others.
+
+---
+
+## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
@@ -105,38 +92,38 @@ curl http://localhost:16889/usage
 | `PROXY_CB_BACKOFF_RESET` | `600.0` | Healthy seconds before circuit resets |
 | `PROXY_CB_HEALTH_INTERVAL` | `15.0` | Half-open health check interval (seconds) |
 
-### Reliability · Retry + Circuit Breaker
+Transient failures (network blips, 502/503) are retried with exponential backoff. After
+`PROXY_CB_THRESHOLD` consecutive failures within `PROXY_CB_WINDOW`, the circuit opens: every
+request returns 503 immediately until a half-open health check (`PROXY_CB_HEALTH_INTERVAL`)
+succeeds.
 
-Transient failures (network blips, 502/503) are retried automatically with exponential backoff. After `PROXY_CB_THRESHOLD` consecutive failures within `PROXY_CB_WINDOW`, the circuit opens — all requests immediately return 503 until a half-open health check (`PROXY_CB_HEALTH_INTERVAL`) succeeds. No more cascading timeouts.
+---
 
-<a id="comparison"></a>
-##  Comparison
+## Comparison
 
-| | **ds-cc-proxy** | LiteLLM | CCR | OpenRouter |
+| | ds-cc-proxy | LiteLLM | CCR | OpenRouter |
 |---|---|---|---|---|
 | Focus | DeepSeek specialist | General gateway | Multi-provider | Hosted aggregator |
-| Footprint | ~1.5K LOC · 2 deps | ~10K+ LOC · 50+ deps | ~5K+ LOC · 80+ deps | SaaS |
-| Auditable | ✅ 10-minute read | ❌ Days | ❌ Hours | ❌ Closed source |
-| Thinking adapters | ✅ Inject / strip / adaptive | ⚠️ Partial | ❌ Via plugin | ❌ |
-| Sub-agent cost opt. | ✅ Flash + budget control | ❌ | ❌ | ❌ |
-| SSE robustness | ✅ Multi-layer type guards | ✅ | ⚠️ Generic | ❌ |
-| Security hardening | ✅ 12 fixes | ✅ Enterprise | ⚠️ Basic | N/A |
+| Footprint | ~1.5K LOC, 2 deps | ~10K+ LOC, 50+ deps | ~5K+ LOC, 80+ deps | SaaS |
+| Auditable | Yes, 10-minute read | No, days | No, hours | No, closed source |
+| Thinking adapters | Inject / strip / adaptive | Partial | Via plugin | No |
+| Sub-agent cost control | Flash + budget | No | No | No |
+| SSE robustness | Multi-layer type guards | Yes | Generic | No |
+| Security hardening | 12 fixes | Enterprise | Basic | N/A |
 
-> **Pick ds-cc-proxy** if DeepSeek is your daily driver and you want stability, cost savings, and zero config.
->
-> **Pick LiteLLM / CCR / OpenRouter** if you need multi-provider switching, enterprise RBAC, or don't use DeepSeek thinking modes.
-
----
-
-##  Coexistence with Local Proxies
-
-ds-cc-proxy (`127.0.0.1:16889`) handles only Claude Code traffic. Clash Verge, V2Ray, and other system-level proxies work at different network layers — run both simultaneously, no configuration needed.
+Pick ds-cc-proxy if DeepSeek is your daily driver and you want stability and cost savings with
+no configuration. Pick LiteLLM, CCR or OpenRouter if you need multi-provider switching,
+enterprise RBAC, or do not use DeepSeek thinking modes.
 
 ---
 
-##  Project Origin
+## Notes
 
-Forked from [HosheaLi/P14_dsv4ToCC](https://github.com/HosheaLi/P14_dsv4ToCC) v1.8.0. Earlier versions were released as `dsv4-cc-proxy`. v0.1.22 was renamed to `ds-cc-proxy`. Upgrading:
+`127.0.0.1:16889` handles Claude Code traffic only. Clash Verge, V2Ray and other system-level
+proxies work at different network layers; both run at the same time with no configuration.
+
+Forked from [HosheaLi/P14_dsv4ToCC](https://github.com/HosheaLi/P14_dsv4ToCC) v1.8.0. Earlier
+versions were published as `dsv4-cc-proxy`; renamed at v0.1.22.
 
 ```bash
 pip uninstall dsv4-cc-proxy && pip install ds-cc-proxy
@@ -144,10 +131,4 @@ pip uninstall dsv4-cc-proxy && pip install ds-cc-proxy
 
 ---
 
-<div align="center">
-
-## License
-
-MIT · [snowspruce/ds-cc-proxy](https://github.com/snowspruce/ds-cc-proxy) · [中文](./README_CN.md)
-
-</div>
+MIT
