@@ -18,6 +18,7 @@ from ds_cc_proxy.proxy import (
     _billing_cost_rmb,
     _build_response_headers,
     _dns_error_severity,
+    _extract_error_detail,
     _extract_usage,
     _has_thinking,
     _has_tool_use,
@@ -31,6 +32,9 @@ from ds_cc_proxy.proxy import (
     _scan_sse_usage,
     _summarize_request,
     _thinking_requested,
+    adapt_tool_definitions,
+    adapt_tool_removals,
+    sanitize_tool_schemas,
 )
 
 # ---------------------------------------------------------------------------
@@ -955,3 +959,246 @@ class TestBillingCost:
             for w in sb
         )
         assert saved == pytest.approx(24.2)
+
+
+# ---------------------------------------------------------------------------
+# Claude Code 2.1.286+ compatibility: tool_definition / tool_removal / schema
+# ---------------------------------------------------------------------------
+
+
+class TestAdaptToolDefinitions:
+    def test_converts_tool_definition_to_tool_reference(self):
+        data = {
+            "model": "deepseek-v4",
+            "tools": [{"name": "Bash", "description": "run bash"}],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "tool_addition",
+                            "tool": {
+                                "type": "tool_definition",
+                                "definition": {
+                                    "name": "mcp__github__search",
+                                    "description": "search github",
+                                    "input_schema": {"type": "object"},
+                                },
+                            },
+                        },
+                        {"type": "text", "text": "other block"},
+                    ],
+                },
+            ],
+        }
+        res = adapt_tool_definitions(data)
+        assert res is data
+        assert data["messages"][1]["content"][0] == {
+            "type": "tool_addition",
+            "tool": {"type": "tool_reference", "name": "mcp__github__search"},
+        }
+        assert data["messages"][1]["content"][1] == {"type": "text", "text": "other block"}
+        assert data["tools"] == [{"name": "Bash", "description": "run bash"}]
+
+    def test_skips_invalid_or_malformed_structures(self):
+        assert adapt_tool_definitions(None) is None  # type: ignore[arg-type]
+        assert adapt_tool_definitions({"messages": "bad"}) == {"messages": "bad"}
+        malformed_blocks = [
+            "not_a_dict",
+            {"type": "text", "text": "keep"},
+            {"type": "tool_addition", "tool": "not_a_dict"},
+            {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "ok"}},
+            {"type": "tool_addition", "tool": {"type": "tool_definition", "definition": None}},
+            {
+                "type": "tool_addition",
+                "tool": {"type": "tool_definition", "definition": {"name": ""}},
+            },
+            {
+                "type": "tool_addition",
+                "tool": {"type": "tool_definition", "definition": {"name": 123}},
+            },
+        ]
+        data = {
+            "messages": [
+                "not_a_dict",
+                {"role": "user", "content": "plain"},
+                {"role": "system", "content": malformed_blocks},
+            ]
+        }
+        res = adapt_tool_definitions(data)
+        assert res["messages"][2]["content"][3] == {
+            "type": "tool_addition",
+            "tool": {"type": "tool_reference", "name": "ok"},
+        }
+        assert res["messages"][2]["content"][5]["tool"]["type"] == "tool_definition"
+        assert res["messages"][2]["content"][6]["tool"]["type"] == "tool_definition"
+
+
+class TestAdaptToolRemovals:
+    def test_strips_tool_removal_and_migrates_cache_control(self):
+        data = {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "<system-reminder>ok</system-reminder>"},
+                        {
+                            "type": "tool_removal",
+                            "tool": {"type": "tool_reference", "name": "mcp__old__tool"},
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ],
+                },
+            ]
+        }
+        assert adapt_tool_removals(data) is True
+        assert data["messages"][1]["content"] == [
+            {
+                "type": "text",
+                "text": "<system-reminder>ok</system-reminder>",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+    def test_does_not_overwrite_existing_cache_control(self):
+        data = {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "tool_removal",
+                            "tool": {"type": "tool_reference", "name": "mcp__a"},
+                            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                        },
+                        {
+                            "type": "tool_addition",
+                            "tool": {"type": "tool_reference", "name": "mcp__b"},
+                            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                        },
+                    ],
+                },
+            ]
+        }
+        assert adapt_tool_removals(data) is True
+        assert data["messages"][1]["content"] == [
+            {
+                "type": "tool_addition",
+                "tool": {"type": "tool_reference", "name": "mcp__b"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            }
+        ]
+
+    def test_drops_empty_system_turn_and_preserves_user_turn(self):
+        sys_only = {
+            "messages": [
+                {"role": "user", "content": "u1"},
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "tool_removal",
+                            "tool": {"type": "tool_reference", "name": "mcp__gone"},
+                        }
+                    ],
+                },
+            ]
+        }
+        assert adapt_tool_removals(sys_only) is True
+        assert sys_only["messages"] == [{"role": "user", "content": "u1"}]
+
+        user_mid = {
+            "messages": [
+                {"role": "assistant", "content": [{"type": "text", "text": "a1"}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_removal",
+                            "tool": {"type": "tool_reference", "name": "mcp__u"},
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "a2"}]},
+            ]
+        }
+        assert adapt_tool_removals(user_mid) is True
+        assert user_mid["messages"][1] == {
+            "role": "user",
+            "content": [{"type": "text", "text": " ", "cache_control": {"type": "ephemeral"}}],
+        }
+
+    def test_noop_and_malformed_safety(self):
+        assert adapt_tool_removals(None) is False  # type: ignore[arg-type]
+        assert adapt_tool_removals({"messages": "bad"}) is False
+        assert adapt_tool_removals({"messages": ["bad", {"role": "user", "content": "hi"}]}) is (
+            False
+        )
+
+
+class TestSanitizeToolSchemas:
+    def test_strips_nul_and_lookaround_while_preserving_valid_patterns(self):
+        connector_pat = "^(?!.*[._]{2})[A-Za-z0-9._-]+$"
+        data = {
+            "tools": [
+                {
+                    "name": "Artifact",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_paths": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "pattern": "^[^\\0]*$",
+                                },
+                            },
+                            "asset_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                            "connector": {
+                                "anyOf": [
+                                    {"type": "string", "pattern": connector_pat},
+                                    {"type": "null"},
+                                ]
+                            },
+                            "pattern": {
+                                "type": "string",
+                                "default": {"pattern": "^[^\\0]*$"},
+                            },
+                            "literal_bs_zero": {"type": "string", "pattern": "^\\\\0$"},
+                            "char_class_parens": {"type": "string", "pattern": "^[(?!]+$"},
+                        },
+                    },
+                }
+            ]
+        }
+        assert sanitize_tool_schemas(data) is True
+        props = data["tools"][0]["input_schema"]["properties"]
+        assert "pattern" not in props["file_paths"]["items"]
+        assert props["file_paths"]["items"]["minLength"] == 1
+        assert "pattern" not in props["connector"]["anyOf"][0]
+        assert props["asset_id"]["pattern"] == "^[0-9a-f]{32}$"
+        assert props["pattern"]["default"] == {"pattern": "^[^\\0]*$"}
+        assert props["literal_bs_zero"]["pattern"] == "^\\\\0$"
+        assert props["char_class_parens"]["pattern"] == "^[(?!]+$"
+        assert sanitize_tool_schemas(data) is False
+
+    def test_noop_on_malformed_tools(self):
+        assert sanitize_tool_schemas(None) is False  # type: ignore[arg-type]
+        assert sanitize_tool_schemas({"tools": "bad"}) is False
+        assert sanitize_tool_schemas({"tools": ["bad", {"name": "no_schema"}]}) is False
+
+
+class TestExtractErrorDetail:
+    def test_extracts_anthropic_error_envelope(self):
+        raw = b'{"error":{"type":"invalid_request_error","message":"bad tool schema"}}'
+        assert _extract_error_detail(raw) == "invalid_request_error: bad tool schema"
+
+    def test_handles_plain_text_and_empty(self):
+        assert _extract_error_detail(b"") == ""
+        assert _extract_error_detail(b"plain upstream error\nline2") == "plain upstream error line2"
