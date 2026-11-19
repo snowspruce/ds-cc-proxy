@@ -176,3 +176,99 @@ async def test_flash_model_routes_as_subagent(monkeypatch):
     assert fake_client.built is not None
     method, url, _headers, _content = fake_client.built
     assert url.startswith("https://flash.example.com")
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_forwards_body_and_adapts_tools(monkeypatch):
+    """POST /v1/messages/count_tokens reads body, sets exact Content-Length,
+    adapts Claude Code 2.1.286+ blocks/schemas without mutating thinking/model,
+    and does not pollute /usage billing counters."""
+    import json
+
+    proxy_module._shutting_down = False
+    proxy_module._circuit_state = "closed"
+    proxy_module._circuit_failure_times.clear()
+    proxy_module._circuit_failure_weight = 0.0
+    before_reqs = proxy_module._usage["requests"]
+
+    fake_resp = _FakeUpstreamResp([b'{"input_tokens": 128}'], "application/json", 200)
+    fake_client = _FakeClient(fake_resp)
+    monkeypatch.setattr(proxy_module, "_get_client", lambda: fake_client)
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    payload = {
+        "model": "deepseek-v4-pro",
+        "thinking": {"type": "disabled"},
+        "tools": [
+            {
+                "name": "Artifact",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"p": {"type": "string", "pattern": "^[^\\0]*$"}},
+                },
+            }
+        ],
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "tool_removal",
+                        "tool": {"type": "tool_reference", "name": "mcp__old"},
+                    },
+                    {
+                        "type": "tool_addition",
+                        "tool": {
+                            "type": "tool_definition",
+                            "definition": {"name": "mcp__new", "description": "d"},
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post("/v1/messages/count_tokens", json=payload)
+        assert resp.status_code == 200
+        assert resp.json() == {"input_tokens": 128}
+
+    assert fake_client.built is not None
+    _method, _url, headers, content = fake_client.built
+    assert content is not None and len(content) > 0
+    assert int(headers["content-length"]) == len(content)
+    forwarded = json.loads(content.decode("utf-8"))
+    # thinking & model untouched on count_tokens
+    assert forwarded["thinking"] == {"type": "disabled"}
+    assert forwarded["model"] == "deepseek-v4-pro"
+    # tool_removal stripped, tool_definition downgraded, incompatible regex stripped
+    assert forwarded["messages"][1]["content"] == [
+        {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "mcp__new"}}
+    ]
+    assert "pattern" not in forwarded["tools"][0]["input_schema"]["properties"]["p"]
+    # /usage counters unaffected by count_tokens
+    assert proxy_module._usage["requests"] == before_reqs
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_during_body_returns_499():
+    """ASGI http.disconnect while reading POST body returns 499 instead of hanging."""
+    proxy_module._shutting_down = False
+    app = create_app()
+    sent = []
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages/count_tokens",
+        "headers": [(b"content-length", b"128")],
+    }
+    await app(scope, receive, send)
+    assert sent[0]["status"] == 499

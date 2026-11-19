@@ -694,6 +694,309 @@ def _normalize_thinking(data: dict) -> bool:
     return False
 
 
+# ---- Fix 2.5: Claude Code 2.1.286+ tool protocol & schema compatibility ----
+
+
+def adapt_tool_definitions(request_body: dict) -> dict:
+    """Downgrade Claude Code ``tool_definition`` blocks to DeepSeek-compatible ``tool_reference``.
+
+    Only inspects ``messages[].content[]`` blocks where ``type == "tool_addition"`` and
+    ``tool.type == "tool_definition"``. Malformed structures are skipped safely.
+    """
+    if not isinstance(request_body, dict):
+        return request_body
+
+    messages = request_body.get("messages")
+    if not isinstance(messages, list):
+        return request_body
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_addition":
+                continue
+
+            tool = block.get("tool")
+            if not isinstance(tool, dict) or tool.get("type") != "tool_definition":
+                continue
+
+            definition = tool.get("definition")
+            if not isinstance(definition, dict):
+                continue
+
+            tool_name = definition.get("name")
+            if not isinstance(tool_name, str) or not tool_name:
+                continue
+
+            block["tool"] = {
+                "type": "tool_reference",
+                "name": tool_name,
+            }
+            logger.info("[ADAPT] tool_definition -> tool_reference: %s", tool_name)
+
+    return request_body
+
+
+def _has_tool_definition_blocks(request_body: dict) -> bool:
+    if not isinstance(request_body, dict):
+        return False
+    messages = request_body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_addition":
+                continue
+            tool = block.get("tool")
+            if not isinstance(tool, dict) or tool.get("type") != "tool_definition":
+                continue
+            definition = tool.get("definition")
+            if not isinstance(definition, dict):
+                continue
+            tool_name = definition.get("name")
+            if isinstance(tool_name, str) and tool_name:
+                return True
+    return False
+
+
+def adapt_tool_removals(request_body: dict) -> bool:
+    """Strip Claude Code ``tool_removal`` content blocks unsupported by DeepSeek's endpoint.
+
+    Preserves sibling blocks, migrates trailing ``cache_control`` onto the last remaining
+    non-thinking block when needed, drops empty ``system`` turns, and preserves turn
+    alternation on non-``system`` turns.
+    """
+    if not isinstance(request_body, dict):
+        return False
+
+    messages = request_body.get("messages")
+    if not isinstance(messages, list):
+        return False
+
+    modified = False
+    new_messages = []
+    total_msgs = len(messages)
+
+    for message in messages:
+        if not isinstance(message, dict):
+            new_messages.append(message)
+            continue
+
+        content = message.get("content")
+        if not isinstance(content, list):
+            new_messages.append(message)
+            continue
+
+        has_removal = any(
+            isinstance(b, dict) and b.get("type") == "tool_removal" for b in content
+        )
+        if not has_removal:
+            new_messages.append(message)
+            continue
+
+        modified = True
+        kept_blocks = []
+        removed_cache_control = None
+
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_removal":
+                tool = block.get("tool")
+                tool_name = "?"
+                if isinstance(tool, dict):
+                    if isinstance(tool.get("name"), str) and tool["name"]:
+                        tool_name = tool["name"]
+                    elif isinstance(tool.get("definition"), dict):
+                        dfn_name = tool["definition"].get("name")
+                        if isinstance(dfn_name, str) and dfn_name:
+                            tool_name = dfn_name
+                if "cache_control" in block and block["cache_control"] is not None:
+                    removed_cache_control = block["cache_control"]
+                logger.info("[ADAPT] stripped tool_removal: %s", tool_name)
+                continue
+            kept_blocks.append(block)
+
+        if kept_blocks:
+            if removed_cache_control is not None:
+                last_block = kept_blocks[-1]
+                if (
+                    isinstance(last_block, dict)
+                    and "cache_control" not in last_block
+                    and last_block.get("type") not in ("thinking", "redacted_thinking")
+                ):
+                    last_block["cache_control"] = removed_cache_control
+            message["content"] = kept_blocks
+            new_messages.append(message)
+        else:
+            if message.get("role") == "system" and total_msgs > 1:
+                logger.info("[ADAPT] dropped empty system message after stripping tool_removal")
+                continue
+            fallback_block: dict = {"type": "text", "text": " "}
+            if removed_cache_control is not None:
+                fallback_block["cache_control"] = removed_cache_control
+            message["content"] = [fallback_block]
+            new_messages.append(message)
+
+    if modified:
+        if new_messages:
+            request_body["messages"] = new_messages
+        else:
+            fallback_msg = dict(messages[-1])
+            fallback_msg["content"] = [{"type": "text", "text": " "}]
+            request_body["messages"] = [fallback_msg]
+
+    return modified
+
+
+_SCHEMA_MAP_KEYS = (
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+)
+_SCHEMA_SINGLE_KEYS = (
+    "additionalProperties",
+    "additionalItems",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contains",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "contentSchema",
+)
+_SCHEMA_LIST_KEYS = (
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "prefixItems",
+)
+
+
+def _is_incompatible_rust_regex(pattern: str) -> bool:
+    """Detect JS/PCRE regex constructs rejected by DeepSeek's upstream Rust regex validator."""
+    i = 0
+    n = len(pattern)
+    in_char_class = False
+
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                return True
+            nxt = pattern[i + 1]
+            # Rust regex rejects \0..\9 (NUL/octal/backrefs), \k named backrefs, \c control escapes
+            if ("0" <= nxt <= "9") or nxt in ("k", "c"):
+                return True
+            i += 2
+            continue
+
+        if in_char_class:
+            if ch == "]":
+                in_char_class = False
+            i += 1
+            continue
+
+        if ch == "[":
+            in_char_class = True
+            i += 1
+            if i < n and pattern[i] == "^":
+                i += 1
+            if i < n and pattern[i] == "]":
+                i += 1
+            continue
+
+        # Rust regex rejects lookaround assertions (?=...), (?!...), (?<=...), (?<!...)
+        if ch == "(" and i + 2 < n and pattern[i + 1] == "?":
+            look = pattern[i + 2]
+            if look in ("=", "!"):
+                return True
+            if look == "<" and i + 3 < n and pattern[i + 3] in ("=", "!"):
+                return True
+
+        i += 1
+
+    return False
+
+
+def _sanitize_schema_node(node: dict, tool_name: str) -> bool:
+    if not isinstance(node, dict):
+        return False
+
+    modified = False
+    pat = node.get("pattern")
+    if isinstance(pat, str) and _is_incompatible_rust_regex(pat):
+        node.pop("pattern", None)
+        logger.info("[ADAPT] stripped incompatible regex pattern on tool %s: %s", tool_name, pat)
+        modified = True
+
+    for key in _SCHEMA_MAP_KEYS:
+        mapping = node.get(key)
+        if isinstance(mapping, dict):
+            for sub in mapping.values():
+                if isinstance(sub, dict) and _sanitize_schema_node(sub, tool_name):
+                    modified = True
+
+    items = node.get("items")
+    if isinstance(items, dict):
+        if _sanitize_schema_node(items, tool_name):
+            modified = True
+    elif isinstance(items, list):
+        for sub in items:
+            if isinstance(sub, dict) and _sanitize_schema_node(sub, tool_name):
+                modified = True
+
+    for key in _SCHEMA_SINGLE_KEYS:
+        sub = node.get(key)
+        if isinstance(sub, dict) and _sanitize_schema_node(sub, tool_name):
+            modified = True
+
+    for key in _SCHEMA_LIST_KEYS:
+        arr = node.get(key)
+        if isinstance(arr, list):
+            for sub in arr:
+                if isinstance(sub, dict) and _sanitize_schema_node(sub, tool_name):
+                    modified = True
+
+    return modified
+
+
+def sanitize_tool_schemas(request_body: dict) -> bool:
+    """Strip Rust-incompatible ``pattern`` regexes from ``tools[].input_schema``."""
+    if not isinstance(request_body, dict):
+        return False
+
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return False
+
+    modified = False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        schema = tool.get("input_schema")
+        if not isinstance(schema, dict):
+            continue
+        tool_name = tool.get("name") if isinstance(tool.get("name"), str) else "?"
+        if _sanitize_schema_node(schema, tool_name):
+            modified = True
+
+    return modified
+
+
 # ---- Fix 3: response-side thinking stripping ----
 
 
@@ -828,6 +1131,27 @@ def _build_response_headers(upstream_resp, is_sse: bool) -> dict:
     return {k: v for k, v in upstream_resp.headers.items() if k.lower() not in strip_keys}
 
 
+def _extract_error_detail(raw: bytes) -> str:
+    """Extract a short, secret-free ``type: message`` summary from an upstream error payload."""
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        text = raw.decode("utf-8", errors="replace").strip().replace("\n", " ")
+        return text[:200]
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            err_type = err.get("type", "")
+            err_msg = str(err.get("message", "")).replace("\n", " ")
+            summary = f"{err_type}: {err_msg}" if err_type else err_msg
+            return summary[:240]
+        if "detail" in payload:
+            return str(payload["detail"]).replace("\n", " ")[:200]
+    return ""
+
+
 async def proxy(request):
     # S0: reject new requests during shutdown
     if _shutting_down:
@@ -851,13 +1175,18 @@ async def proxy(request):
     path = "/" + raw_path.lstrip("/")
     upstream_url = f"{DEEPSEEK_BASE}{path}"
 
-    # S2: strip dangerous request headers
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in _REQUEST_STRIP_HEADERS}
+    # S2: strip dangerous request headers (content-length is set from actual body bytes below)
+    headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in _REQUEST_STRIP_HEADERS and k.lower() != "content-length"
+    }
 
     is_messages = method == "POST" and path.rstrip("/").endswith("/messages")
+    is_count_tokens = method == "POST" and path.rstrip("/").endswith("/messages/count_tokens")
 
     # S9: limit request body size
-    if is_messages:
+    if method == "POST":
         content_length = request.headers.get("content-length")
         if content_length:
             try:
@@ -875,10 +1204,17 @@ async def proxy(request):
             except (TypeError, ValueError):
                 pass
 
-    body = await request.body() if is_messages else b""
+    try:
+        body = await request.body() if method == "POST" else b""
+    except _ClientDisconnectError:
+        logger.debug("[REQ] client disconnected while reading body: %s", path)
+        return JSONResponse(
+            {"error": {"message": "client disconnected", "type": "client_disconnect"}},
+            status_code=499,
+        )
 
     # S9: double-check actual body size after read
-    if is_messages and len(body) > MAX_BODY_BYTES:
+    if method == "POST" and len(body) > MAX_BODY_BYTES:
         logger.warning("[SEC] request body exceeds limit after read: %d bytes", len(body))
         return JSONResponse(
             {
@@ -891,12 +1227,12 @@ async def proxy(request):
         )
 
     modified_body = body
-    strip_thinking = True
-
+    strip_thinking = False
     is_subagent = False
     model_name = "?"
 
     if is_messages:
+        strip_thinking = True
         try:
             data = json.loads(body)
             model_name = data.get("model", "?")
@@ -917,6 +1253,14 @@ async def proxy(request):
                 logger.info("[INJECT] added empty thinking block")
                 thinking_normalized = True
 
+            if adapt_tool_removals(data):
+                thinking_normalized = True
+            if _has_tool_definition_blocks(data):
+                thinking_normalized = True
+            data = adapt_tool_definitions(data)
+            if sanitize_tool_schemas(data):
+                thinking_normalized = True
+
             if original_thinking_enabled:
                 strip_thinking = False
             else:
@@ -934,13 +1278,29 @@ async def proxy(request):
 
             if thinking_normalized:
                 modified_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-                headers["content-length"] = str(len(modified_body))
                 _dump_json("last_request_modified.json", data)
 
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             logger.warning("[REQ] invalid JSON body, forwarding as-is")
         except (KeyError, TypeError):
             logger.exception("[REQ] unexpected body structure, forwarding as-is")
+
+    elif is_count_tokens and body and not request.headers.get("content-encoding"):
+        try:
+            data = json.loads(body)
+            changed = adapt_tool_removals(data)
+            if _has_tool_definition_blocks(data):
+                data = adapt_tool_definitions(data)
+                changed = True
+            if sanitize_tool_schemas(data):
+                changed = True
+            if changed:
+                modified_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
+            logger.debug("[REQ] count_tokens body not adaptable JSON, forwarding as-is")
+
+    if method == "POST":
+        headers["content-length"] = str(len(modified_body))
 
     role = "subagent" if is_subagent else "primary"
 
@@ -1013,12 +1373,28 @@ async def proxy(request):
 
     # If upstream returned an error, passthrough raw response regardless of content-type
     if upstream_resp.status_code >= 400:
-        logger.warning("[RESP] upstream error %s, passthrough", upstream_resp.status_code)
+        logger.warning(
+            "[RESP] upstream error %s (%s %s), passthrough",
+            upstream_resp.status_code,
+            method,
+            path,
+        )
 
         async def error_passthrough():
+            err_buf = bytearray()
             try:
                 async for chunk in upstream_resp.aiter_bytes():
+                    if len(err_buf) < 2048:
+                        err_buf.extend(chunk[: 2048 - len(err_buf)])
                     yield chunk
+                detail = _extract_error_detail(bytes(err_buf))
+                if detail:
+                    logger.warning(
+                        "[RESP] upstream %s detail (%s): %s",
+                        upstream_resp.status_code,
+                        path,
+                        detail,
+                    )
             except Exception:
                 logger.exception("upstream error stream read error")
             finally:
@@ -1051,7 +1427,8 @@ async def proxy(request):
                 except Exception:
                     logger.exception("upstream stream read error")
                 finally:
-                    _log_and_track_usage(role, model_name, response_usage)
+                    if is_messages:
+                        _log_and_track_usage(role, model_name, response_usage)
                     try:
                         await upstream_resp.aclose()
                     except Exception:
@@ -1070,7 +1447,7 @@ async def proxy(request):
             try:
                 async for chunk in upstream_resp.aiter_bytes():
                     body += chunk
-                if body:
+                if is_messages and body:
                     try:
                         payload = json.loads(body)
                     except json.JSONDecodeError:
@@ -1083,7 +1460,8 @@ async def proxy(request):
             except Exception:
                 logger.exception("upstream stream read error")
             finally:
-                _log_and_track_usage(role, model_name, response_usage)
+                if is_messages:
+                    _log_and_track_usage(role, model_name, response_usage)
                 try:
                     await upstream_resp.aclose()
                 except Exception:
@@ -1115,6 +1493,7 @@ async def proxy(request):
                     buffer = ""
                     continue
 
+                out_lines = []
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     line = line.rstrip("\r")  # C1: handle SSE \r\n per spec
@@ -1125,7 +1504,9 @@ async def proxy(request):
                     if filtered is not None:
                         if len(all_filtered) < MAX_FILTERED_LINES:
                             all_filtered.append(filtered)
-                        yield (filtered + "\n").encode("utf-8")
+                        out_lines.append(filtered + "\n")
+                if out_lines:
+                    yield "".join(out_lines).encode("utf-8")
 
             # C1: handle trailing buffer (rstrip \r as above)
             buffer = buffer.rstrip("\r")
@@ -1188,6 +1569,10 @@ class _URL:
         self.path = path
 
 
+class _ClientDisconnectError(Exception):
+    """Raised when the ASGI client disconnects before finishing request body upload."""
+
+
 class Request:
     """Request shim exposing the subset of Starlette's Request used by handlers."""
 
@@ -1203,10 +1588,13 @@ class Request:
         if not self._body:
             while True:
                 message = await self._receive()
-                if message["type"] == "http.request":
+                msg_type = message.get("type")
+                if msg_type == "http.request":
                     self._body += message.get("body", b"")
                     if not message.get("more_body", False):
                         break
+                elif msg_type == "http.disconnect":
+                    raise _ClientDisconnectError()
         return self._body
 
 
